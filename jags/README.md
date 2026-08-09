@@ -29,6 +29,14 @@ inside the core the minimum is at the ray's endpoint so ψ is unchanged, while a
 reachable by dipping below `ψ_edge`. It assumes only that the core is star-shaped about the axis,
 which holds for single/double null, Super-X, snowflake and negative triangularity alike.
 
+The same device gives **differentiable flux-surface averages** (`fsa.py`), which a transport solver
+such as TORAX needs as `int_dl_over_Bp`, `⟨1/R²⟩`, `⟨|∇ψ|²⟩` and friends. Computed conventionally
+each is a contour integral, reintroducing exactly the tracing this package avoids. The co-area
+formula turns them into ratios of *volume* integrals, `⟨X⟩ = Σwᵢxᵢ / Σwᵢ` with
+`wᵢ = 2πRᵢ δ_ε(ψᵢ − ψ₀) dA` — one weighted sum over the grid, no contour, smooth in ψ. Ratios reach
+1e-4 outside `r/a ≈ 0.3`; absolute integrals carry ~1%, and the innermost surfaces are unresolved by
+any grid-based method. `fsa.py`'s docstring quantifies all three.
+
 ## Results
 
 Cross-checked against FreeGSNKE on MAST-U at 65×65 — identical grid, limiter, vacuum flux and
@@ -64,6 +72,7 @@ jags/
   jacobian.py   matrix-free GMRES step, and a chunked dense Jacobian as reference
   solver.py     residual, Picard warm-up, exact Newton with Armijo; make_solver compiles once
   critical.py   diagnostics only: axis by implicit function theorem, soft-max boundary flux
+  fsa.py        flux-surface averages by the co-area formula -- no contour tracing
 scripts/
   dump_freegsnke_case.py   run in the FreeGSNKE venv -> .npz reference
   compare.py               re-solve, report metrics, write the figure
