@@ -157,3 +157,49 @@ def test_jtor_respects_ip_constraint():
 
     j = profiles.jtor(pr, jnp.asarray(g.R), psi, mask, Ip=4.2e5, dA=g.dA)
     assert float(jnp.sum(j)) * g.dA == pytest.approx(4.2e5, rel=1e-12)
+
+
+def test_topeol_matches_the_freegs4e_current_expressions():
+    """``topeol`` must reproduce FreeGS4E's ConstrainBetapIp derivatives exactly.
+
+    FreeGS4E writes the current, not the profiles
+    (``freegs4e/jtor.py:48-155``)::
+
+        p'  = (L Beta0 / Raxis) (1 - psiN^m)^n
+        FF' = mu0 L (1 - Beta0) Raxis (1 - psiN^m)^n
+
+    jags integrates those to p(psi) and F(psi) and differentiates back with
+    autodiff, so agreement here is a round trip through the antiderivative.
+    This profile exists because ``lao85`` collapses at a large major radius;
+    see its docstring.
+    """
+    pa, pb, L, B0, Ra, fvac, m, n = 2.0, 0.5, 1.234e6, 0.3, 6.2, 32.86, 2.0, 1
+    prof = profiles.topeol(pa, pb, L, B0, Ra, fvac, alpha_m=m, alpha_n=n)
+
+    # Interior only: at exactly psi_axis the clip kink halves the derivative,
+    # the same documented behaviour as test_lao85_endpoint_derivative_is_averaged.
+    psi = jnp.linspace(pb, pa, 9)[:-1]
+    shape = (1.0 - ((pa - np.asarray(psi)) / (pa - pb)) ** m) ** n
+
+    np.testing.assert_allclose(
+        np.asarray(profiles.pprime(prof, psi)), L * B0 / Ra * shape, rtol=1e-10
+    )
+    np.testing.assert_allclose(
+        np.asarray(profiles.ffprime(prof, psi)),
+        profiles.MU0 * L * (1 - B0) * Ra * shape, rtol=1e-10,
+    )
+    # Compact support: nothing outside the plasma, and F back to vacuum.
+    outside = jnp.asarray([pb - 1.0, pb - 0.1])
+    np.testing.assert_allclose(np.asarray(prof.p(outside)), 0.0, atol=1e-12)
+    np.testing.assert_allclose(np.asarray(prof.F(outside)), fvac, rtol=1e-12)
+
+
+def test_topeol_rejects_non_integer_alpha_n():
+    """The antiderivative is a finite binomial sum only for integer alpha_n.
+
+    For anything else it is an incomplete beta function, so the constructor
+    refuses rather than quietly returning a profile that is not the one asked
+    for.
+    """
+    with pytest.raises(ValueError, match="alpha_n"):
+        profiles.topeol(2.0, 0.5, 1e6, 0.3, 6.2, 32.86, alpha_m=2.0, alpha_n=1.5)

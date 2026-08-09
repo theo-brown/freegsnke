@@ -24,6 +24,7 @@ surface during the solve -- see the module docstring of ``solver.py``.
 
 from __future__ import annotations
 
+import math
 from typing import Callable, NamedTuple
 
 import jax
@@ -198,5 +199,63 @@ def compact(psi_edge, psi_scale, p0, fvac, f1=0.0, alpha_p=2.5, alpha_f=2.5):
         inside, s = _inside_and_safe(psi)
         f2 = jnp.where(inside, f1 * s**alpha_f, 0.0)
         return jnp.sqrt(fvac**2 + f2)
+
+    return Profile(p, F)
+
+
+def topeol(psi_axis, psi_bndry, L, Beta0, Raxis, fvac, alpha_m=2.0, alpha_n=1):
+    """FreeGS4E's ``ConstrainBetapIp`` / Topeol family, as p(psi) and F(psi).
+
+    FreeGS4E specifies the current directly (``freegs4e/jtor.py:48-155``)::
+
+        Jtor = L [ Beta0 R / Raxis + (1 - Beta0) Raxis / R ] (1 - psiN^m)^n
+
+    Matching against ``Jtor = R p' + FF'/(mu0 R)`` term by term gives
+
+        p'  = (L Beta0 / Raxis) (1 - psiN^m)^n
+        FF' = mu0 L (1 - Beta0) Raxis (1 - psiN^m)^n
+
+    both derivatives with respect to *unnormalised* psi, as FreeGS uses them.
+
+    This exists because ``lao85`` is unusable at a large major radius: its
+    ``FF' ~ Raxis`` and ``p' ~ 1/Raxis`` scaling makes the FF' term dominate, and
+    on ITER (Raxis = 6.2) an inverse solve with it collapses the plasma to a few
+    cells. The Topeol form splits the same two terms with an explicit ``Beta0``
+    instead, which is why FreeGSNKE's own ITER example uses it.
+
+    ``alpha_n`` must be a non-negative integer: the shape is then a finite
+    binomial sum and the antiderivative is elementary. For non-integer
+    ``alpha_n`` the integral is an incomplete beta function, which has no useful
+    closed form here, so it is rejected rather than silently approximated.
+
+    Compact support above ``psi_bndry`` comes from clipping psiN at 1, exactly
+    as in ``lao85``.
+    """
+    if int(alpha_n) != alpha_n or alpha_n < 0:
+        raise ValueError(f"alpha_n must be a non-negative integer, got {alpha_n}")
+    alpha_n = int(alpha_n)
+    span = psi_axis - psi_bndry
+
+    # (1 - x^m)^n = sum_k C(n,k) (-1)^k x^(mk), so the antiderivative that
+    # vanishes at x = 1 is sum_k C(n,k) (-1)^k (x^(mk+1) - 1) / (mk + 1).
+    coeffs = []
+    for k in range(alpha_n + 1):
+        c = math.comb(alpha_n, k) * (-1) ** k
+        coeffs.append((c / (alpha_m * k + 1.0), alpha_m * k + 1.0))
+
+    def _shape_integral(psi):
+        """int_{psiN}^{1} (1 - u^m)^n du, times ``span``, so it is d(.)/dpsi."""
+        x = jnp.clip((psi_axis - psi) / span, 0.0, 1.0)
+        total = 0.0
+        for c, power in coeffs:
+            total = total + c * (1.0 - x**power)
+        return span * total
+
+    def p(psi):
+        return (L * Beta0 / Raxis) * _shape_integral(psi)
+
+    def F(psi):
+        ff = MU0 * L * (1.0 - Beta0) * Raxis
+        return jnp.sqrt(fvac**2 + 2.0 * ff * _shape_integral(psi))
 
     return Profile(p, F)
