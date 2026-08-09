@@ -11,6 +11,8 @@ surfaces of radius r centred at R0, with psi = -r^2 so |grad psi| = 2r:
     <|grad psi|^2> = 4 r^2
 """
 
+import pathlib
+
 import jax
 import numpy as np
 import pytest
@@ -19,8 +21,9 @@ jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp  # noqa: E402
 
-from jags.fsa import make_flux_surface_averager  # noqa: E402
+from jags.fsa import make_flux_surface_averager, safety_factor  # noqa: E402
 from jags.grid import Grid  # noqa: E402
+from jags.reach import make_reachability  # noqa: E402
 
 R0 = 1.0
 BOX = np.array([[0.35, -0.6], [1.65, -0.6], [1.65, 0.6], [0.35, 0.6]])
@@ -166,6 +169,49 @@ def test_differentiable_with_respect_to_psi(quantity):
         fd = float((scalar(psi + h * v) - scalar(psi - h * v)) / (2 * h))
         ad = float((grad * v).sum())
         assert abs(fd - ad) <= 1e-5 * max(1.0, abs(fd)), f"{fd:.6e} vs {ad:.6e}"
+
+
+def test_diverted_level_sets_need_the_reachability():
+    """On a real diverted equilibrium, a raw level set of psi is not a surface.
+
+    Contours near the separatrix reappear in the divertor legs, and the kernel
+    sums over those too, so q comes out far too large. ``reach.py`` is the fix,
+    and the two ways of applying it must both help, with ``label`` -- which
+    replaces the flux label outright rather than fading cells out -- ahead.
+
+    Tolerances here are loose *because the reference grid is 65x65*: the
+    committed case is the one the solver comparison uses, and at that resolution
+    the co-area quadrature is barely resolved. The convergence study behind the
+    numbers in ``fsa.py``'s docstring runs the same check at 129 and 193, where
+    the median falls to 9.1e-3 and 2.0e-3. This test pins the *ordering*, which
+    is resolution-independent, plus a ceiling.
+    """
+    d = np.load(pathlib.Path(__file__).parent.parent / "scripts/case_diverted.npz")
+    limiter = np.stack([d["limiter_R"], d["limiter_Z"]], axis=-1)
+    g = Grid(float(d["Rmin"]), float(d["Rmax"]), float(d["Zmin"]), float(d["Zmax"]),
+             int(d["nR"]), int(d["nZ"]), limiter)
+
+    psi = jnp.asarray(d["psi"])
+    pa, pb = float(d["psi_axis"]), float(d["psi_bndry"])
+    pn, ref = np.asarray(d["psinorm"]), np.asarray(d["q"])
+    levels = jnp.asarray(pa + pn * (pb - pa))
+    scale = abs(pa - pb)
+
+    _, surfaces, _ = make_flux_surface_averager(g, eps=0.01)
+    m = make_reachability(g, n_samples=64, beta_norm=2e5)(psi)
+
+    def err(**kw):
+        q = np.asarray(safety_factor(surfaces(psi, levels, scale, **kw),
+                                     jnp.asarray(d["fpol"])))
+        return float(np.median(np.abs(q - ref) / ref))
+
+    raw = err()
+    mask = err(mask=jax.nn.sigmoid((m - pb) / (0.02 * scale)))
+    label = err(label=m)
+
+    assert raw > 0.2, f"raw level set unexpectedly accurate ({raw:.2e})"
+    assert label < mask < raw, f"{label:.2e} !< {mask:.2e} !< {raw:.2e}"
+    assert label < 0.05
 
 
 def test_mask_restricts_the_average(case):

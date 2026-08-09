@@ -33,9 +33,23 @@ The same device gives **differentiable flux-surface averages** (`fsa.py`), which
 such as TORAX needs as `int_dl_over_Bp`, `⟨1/R²⟩`, `⟨|∇ψ|²⟩` and friends. Computed conventionally
 each is a contour integral, reintroducing exactly the tracing this package avoids. The co-area
 formula turns them into ratios of *volume* integrals, `⟨X⟩ = Σwᵢxᵢ / Σwᵢ` with
-`wᵢ = 2πRᵢ δ_ε(ψᵢ − ψ₀) dA` — one weighted sum over the grid, no contour, smooth in ψ. Ratios reach
-1e-4 outside `r/a ≈ 0.3`; absolute integrals carry ~1%, and the innermost surfaces are unresolved by
-any grid-based method. `fsa.py`'s docstring quantifies all three.
+`wᵢ = 2πRᵢ δ_ε(ψᵢ − ψ₀) dA` — one weighted sum over the grid, no contour, smooth in ψ. For a
+diverted plasma the level sets must be taken from the reachability rather than from ψ, or the kernel
+sums over the divertor legs too; `surfaces(..., label=m)` does that, keeping `|∇ψ|` physical.
+
+Checked on the MAST-U diverted case against **two** contour-tracing codes — FreeGS4E's ray-traced
+`q` and TORAX's `contourpy`-based eqdsk parser — on the same ψ:
+
+| grid | jags vs FreeGS4E `q` | FreeGS4E vs TORAX `q` |
+|---|---|---|
+| 65×65 | 4.0e-02 | 2.2e-02 |
+| 129×129 | 9.1e-03 | 1.1e-02 |
+| 193×193 | **2.0e-03** | 9.4e-03 |
+
+(median relative error, `eps=0.01`). From 129 up jags sits inside the spread between the two
+references. Across the whole `FluxSurfaces` bundle at 193×193, over `0.2 ≤ ψ_N ≤ 0.8`, every quantity
+matches TORAX to 1.1e-2 or better. Outside that band both failure modes are real and documented in
+`fsa.py`: the innermost surfaces are unresolved by *any* grid method, and coarse grids alias.
 
 ## Results
 
@@ -74,8 +88,10 @@ jags/
   critical.py   diagnostics only: axis by implicit function theorem, soft-max boundary flux
   fsa.py        flux-surface averages by the co-area formula -- no contour tracing
 scripts/
-  dump_freegsnke_case.py   run in the FreeGSNKE venv -> .npz reference
+  dump_freegsnke_case.py   run in the FreeGSNKE venv -> .npz + .geqdsk reference
   compare.py               re-solve, report metrics, write the figure
+  check_fsa_torax.py       run in the TORAX venv -> its eqdsk parser's own FSAs
+  check_fsa.py             flux-surface averages vs both tracing codes
 ```
 
 Everything geometry-only is precomputed in NumPy/SciPy and frozen as constants, so **JAX never needs
@@ -106,13 +122,22 @@ uv pip install --python .venv/bin/python jax jaxlib numpy scipy pytest matplotli
 uv venv --python 3.10 ../.venv-freegsnke
 uv pip install --python ../.venv-freegsnke/bin/python "freegs4e>=0.11" -e ..   # the repo root
 
-PYTHONPATH=. .venv/bin/python -m pytest tests -q     # 36 tests
+PYTHONPATH=. .venv/bin/python -m pytest tests -q     # 49 tests
 PYTHONPATH=. .venv/bin/python scripts/compare.py     # reference .npz files are committed
+PYTHONPATH=. .venv/bin/python scripts/check_fsa.py   # flux-surface averages
 
 # to regenerate the reference equilibria (needs the FreeGSNKE venv, and must not
-# run from the repo root or the local package shadows the installed one):
+# run from the repo root or the local package shadows the installed one). The
+# trailing argument is the grid size; the convergence study in fsa.py used 129
+# and 193, which are left in /tmp rather than committed:
 cd /tmp && ../.venv-freegsnke/bin/python <repo>/jags/scripts/dump_freegsnke_case.py \
-    <repo>/jags/scripts/case_diverted.npz diverted
+    <repo>/jags/scripts/case_diverted.npz diverted 65
+
+# the TORAX reference needs a third venv, since TORAX pins numpy>2 and its own
+# deps; only its eqdsk parser is used, on the .geqdsk written above
+<torax>/.venv/bin/python scripts/check_fsa_torax.py \
+    scripts/case_diverted.geqdsk /tmp/torax_diverted_65.npz
+PYTHONPATH=. .venv/bin/python scripts/check_fsa.py --all
 ```
 
 `jax.config.update("jax_enable_x64", True)` is required — in float32 Newton stalls near 1e-4.

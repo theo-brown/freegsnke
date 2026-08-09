@@ -40,16 +40,39 @@ closed form (``test_fsa.py``), at eps = 0.01:
   amplifies its ~5e-4 error. There is no free lunch here: ``dV_dpsi`` *is* the
   derivative of ``volume``, so the two errors are the same error.
 
+On a **real diverted equilibrium** -- FreeGSNKE's MAST-U case, checked against
+FreeGS4E's ray-traced ``q`` and against TORAX's ``contourpy``-based eqdsk parser
+on the same psi (``scripts/check_fsa.py``) -- the picture is the same but the
+resolution demand is much higher, because the core spans far fewer cells than in
+the circular test. Median relative error in ``q`` against FreeGS4E, using
+``label=`` reachability at eps = 0.01:
+
+    65x65   4.0e-2      129x129  9.1e-3      193x193  2.0e-3
+
+For scale, the **two tracing codes disagree with each other** by 2.2e-2, 1.1e-2
+and 9.4e-3 at those resolutions, so from 129 up jags sits inside the spread
+between the references, and at 193 it is closer to FreeGS4E's ``q`` than TORAX
+is. Across the whole ``FluxSurfaces`` bundle at 193x193, over the band
+0.2 <= psi_N <= 0.8, every quantity agrees with TORAX to 1.1e-2 or better and
+most to ~2e-3.
+
 Two failure modes bound the useful range, and they pull in opposite directions:
 
 * **Near the axis** the surfaces are simply not resolved -- at r = 0.03 in a
   domain of minor radius 0.5 a surface is ~3 cells across, and the error is the
   same at 65x65 and 129x129, so it is not fixed by refining. Contour tracing
   fares no better; nothing can average over a curve the grid cannot represent.
-  Expect the innermost ~20% in minor radius to be unusable and extrapolate.
+  Expect the innermost ~20% in minor radius to be unusable and extrapolate. On
+  the MAST-U case *every* quantity's worst error sits on TORAX's innermost
+  surface, psi_N = 0.016, where ``<|grad psi|^2>`` is 33% wrong at both 129 and
+  193 while the same quantity is good to 6e-3 in the band above psi_N = 0.2.
 * **On outer surfaces of a coarse grid** the opposite happens: the band spans a
   fraction of a cell and the quadrature aliases. Widening ``eps`` fixes that but
-  smears neighbouring surfaces, an O(eps) bias. eps ~ 0.01 is the compromise.
+  smears neighbouring surfaces, an O(eps) bias. The two effects set a joint
+  ``(eps, N)`` limit rather than a best eps: sweeping eps on MAST-U, the optimum
+  moves 0.02 -> 0.01 -> 0.01 as N goes 65 -> 129 -> 193 while the error at that
+  optimum falls 7.3e-2 -> 2.4e-2 -> 6.8e-3. Refining alone at fixed eps = 0.01
+  converges; tuning eps alone at fixed N does not.
 
 Making the width track ``|grad psi|`` -- a fixed number of *cells* everywhere --
 does fix the aliasing (``int_dl_over_Bp`` error 9e-2 -> 9e-6 at 65x65) and the
@@ -99,12 +122,22 @@ def make_flux_surface_averager(grid: Grid, eps: float = 0.01):
 
     Returns ``(average, surfaces, grad_psi)``:
 
-    ``average(psi, X, psi_levels, psi_scale, mask=None)``
+    ``average(psi, X, psi_levels, psi_scale, mask=None, label=None)``
         <X> on each level, for an arbitrary field X on the grid.
-    ``surfaces(psi, psi_levels, psi_scale, mask=None)``
+    ``surfaces(psi, psi_levels, psi_scale, mask=None, label=None)``
         the ``FluxSurfaces`` bundle.
     ``grad_psi(psi)``
         ``(dpsi/dR, dpsi/dZ)``, exposed because callers usually need B_p too.
+
+    ``label`` is the field whose level sets define the surfaces, defaulting to
+    ``psi`` itself. It exists for **diverted** equilibria, where a level set of
+    psi is not one closed curve: contours near the separatrix reappear in the
+    divertor legs, and the kernel would sum over those too. Passing
+    ``label=reach.make_reachability(grid)(psi)`` restricts the surfaces to the
+    core -- the reachability equals psi there and drops below the edge in every
+    lobe, so the same device that fixes ``Jtor`` fixes the averages. The
+    gradient stays that of the physical ``psi`` either way, so ``B_p`` is not
+    contaminated by the softmin.
     """
     R = jnp.asarray(grid.R)
     dR, dZ, dA = float(grid.dR), float(grid.dZ), float(grid.dA)
@@ -128,7 +161,7 @@ def make_flux_surface_averager(grid: Grid, eps: float = 0.01):
         )
         return gR, gZ
 
-    def _weights(psi, psi_levels, psi_scale, mask):
+    def _weights(label, psi_levels, psi_scale, mask):
         """Surface weights w_i and enclosed-volume weights, shape (nR, nZ, n).
 
         The surface weight is the derivative of the enclosed indicator, i.e. a
@@ -138,26 +171,30 @@ def make_flux_surface_averager(grid: Grid, eps: float = 0.01):
         are consistent by construction: ``d(enclosed)/d(psi0) = -surface``.
         """
         width = eps * psi_scale
-        u = (psi[..., None] - psi_levels) / width
+        u = (label[..., None] - psi_levels) / width
         enclosed = jax.nn.sigmoid(u)
-        surface = enclosed * (1.0 - enclosed) / width  # d(sigmoid)/d(psi)
+        surface = enclosed * (1.0 - enclosed) / width  # d(sigmoid)/d(label)
         if mask is not None:
             m = mask[..., None]
             enclosed, surface = enclosed * m, surface * m
         return surface, enclosed
 
-    def average(psi, X, psi_levels, psi_scale, mask=None):
+    def average(psi, X, psi_levels, psi_scale, mask=None, label=None):
         """Flux-surface average of ``X`` on each level.
 
         Weighted by ``2 pi R dl / |grad psi|``, the standard volume-weighted
         convention (Wesson), so ``<1> == 1`` identically.
         """
-        surface, _ = _weights(psi, psi_levels, psi_scale, mask)
+        surface, _ = _weights(
+            psi if label is None else label, psi_levels, psi_scale, mask
+        )
         w = surface * two_pi_R_dA[..., None]
         return jnp.sum(w * X[..., None], axis=(0, 1)) / jnp.sum(w, axis=(0, 1))
 
-    def surfaces(psi, psi_levels, psi_scale, mask=None):
-        surface, enclosed = _weights(psi, psi_levels, psi_scale, mask)
+    def surfaces(psi, psi_levels, psi_scale, mask=None, label=None):
+        surface, enclosed = _weights(
+            psi if label is None else label, psi_levels, psi_scale, mask
+        )
         w = surface * two_pi_R_dA[..., None]
         norm = jnp.sum(w, axis=(0, 1))
 

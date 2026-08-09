@@ -10,7 +10,7 @@ of the comparison is the *plasma* solve, so the vacuum field is taken as given
 and identical on both sides.
 
 Usage:
-    <freegsnke-venv>/bin/python scripts/dump_freegsnke_case.py out.npz [limited|diverted]
+    <freegsnke-venv>/bin/python scripts/dump_freegsnke_case.py out.npz [limited|diverted] [n]
 
 The two coil-current sets ship with FreeGSNKE as
 ``examples/data/simple_{limited,diverted}_currents_PaxisIp.pk``. Note that those
@@ -39,7 +39,7 @@ BETA = [1.0, -0.5]
 RAXIS = 0.9
 
 
-def main(out_path, case="limited"):
+def main(out_path, case="limited", n=65):
     from freegsnke import build_machine, equilibrium_update, GSstaticsolver
     from freegsnke.jtor_update import Lao85
 
@@ -54,7 +54,7 @@ def main(out_path, case="limited"):
         tokamak=tokamak,
         Rmin=0.1, Rmax=2.0,
         Zmin=-2.2, Zmax=2.2,
-        nx=65, ny=65,
+        nx=n, ny=n,
         psi=None,
     )
 
@@ -77,6 +77,21 @@ def main(out_path, case="limited"):
     tokamak_psi = eq.tokamak.calcPsiFromGreens(pgreen=eq._pgreen)
     limiter = eq.tokamak.limiter
 
+    # Contour-traced flux-surface quantities, the reference for jags/fsa.py.
+    # FreeGS4E's q is (1/2pi) * contour_int F dl / (R^2 B_p), evaluated on 128
+    # points traced by ray-casting from the O-point (freegs4e/critical.py:1066).
+    # fpol is dumped alongside so the jags side uses an identical F and the
+    # comparison isolates the geometry.
+    # find_safety normalises by the X-point flux and raises without one, so a
+    # genuinely limited equilibrium yields no q profile.
+    psinorm = np.linspace(0.05, 0.95, 19)
+    try:
+        q = np.asarray(eq.q(psinorm))
+    except ValueError as exc:
+        print(f"  no q profile: {exc}")
+        q = np.full_like(psinorm, np.nan)
+    fpol = np.asarray(eq.fpol(psinorm))
+
     np.savez_compressed(
         out_path,
         Rmin=eq.R[0, 0], Rmax=eq.R[-1, 0],
@@ -94,7 +109,26 @@ def main(out_path, case="limited"):
         # profile definition, including the coefficients Lao85 appends internally
         alpha_full=profiles.alpha, beta_full=profiles.beta,
         L=profiles.L, Ip=IP, fvac=FVAC, Raxis=RAXIS,
+        # flux-surface reference
+        psinorm=psinorm, q=q, fpol=fpol,
+        plasma_volume=eq.plasmaVolume(),
     )
+
+    # A geqdsk of the same equilibrium, so TORAX's own eqdsk parser can be run
+    # on it (see check_fsa_torax.py). FreeGS4E writes psi in Wb/rad with the
+    # axis shifted to zero, which is COCOS 1; TORAX converts and then enforces
+    # its own sign convention.
+    from freegs4e import geqdsk
+
+    # FreeGSNKE's Lao85 returns pressure with a leading singleton axis, which
+    # the fixed-width g-file writer cannot format. Everything else is already
+    # 1D, so flatten just this one on the way out.
+    eq.pressure = lambda pn, _p=eq.pressure: np.ravel(_p(pn))
+
+    gfile = str(out_path).replace(".npz", ".geqdsk")
+    with open(gfile, "w") as fh:
+        geqdsk.write(eq, fh, label=case[:8])
+    print(f"wrote {gfile}")
 
     total_ip = profiles.jtor.sum() * (eq.R[1, 0] - eq.R[0, 0]) * (eq.Z[0, 1] - eq.Z[0, 0])
     print(f"wrote {out_path}  (case: {case})")
@@ -105,10 +139,13 @@ def main(out_path, case="limited"):
     print(f"  alpha_full = {profiles.alpha}")
     print(f"  beta_full  = {profiles.beta}")
     print(f"  L          = {profiles.L:.6e}")
+    print(f"  volume     = {eq.plasmaVolume():.6f} m^3")
+    print(f"  q(0.05..0.95) = {np.array2string(q, precision=4)}")
 
 
 if __name__ == "__main__":
     main(
         sys.argv[1] if len(sys.argv) > 1 else "freegsnke_case.npz",
         sys.argv[2] if len(sys.argv) > 2 else "limited",
+        int(sys.argv[3]) if len(sys.argv) > 3 else 65,
     )
