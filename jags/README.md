@@ -186,8 +186,10 @@ checkouts cannot be installed together. The commands above take `freegs4e` from 
 
 - **Forward solves only.** No shape targets, no coil-current optimisation, no time stepping.
 - **Star-shaped core** assumed by `reach.py`; a strongly indented boundary would violate it.
-- **Dense O(N³) linear algebra** in the residual (`A⁻¹` is a dense N×N, 2.2 GB at 129×129). The
-  Newton step itself is matrix-free, so the residual is now the binding constraint.
+- **Memory is the wall, not time.** `A⁻¹` is stored dense, `N×N` with `N = nR·nZ`, so it grows as
+  `n⁴`: 0.13 GB at 65×65, 0.66 GB at 97×97, ~2.1 GB at 129×129, ~10.6 GB at 193×193. Building it is
+  `O(N² log N)` — a *sparse* LU plus N back-substitutions, not a dense inversion — measured `n^4.2`.
+  See `scripts/timing.py`.
 - **X-point diagnostics** seed one saddle above and below the axis; multi-X-point configurations are
   out of scope. `critical.boundary_flux` also maximises over the whole limiter contour where
   FreeGSNKE restricts to cells adjacent to the core — pass `use_limiter=False` when diverted.
