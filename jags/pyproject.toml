@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jags"
+version = "0.1.0"
+description = "A minimal free-boundary Grad-Shafranov solver in JAX with exact Newton via autodiff"
+requires-python = ">=3.11"
+dependencies = ["jax>=0.4.30", "numpy>=1.26", "scipy>=1.11"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "matplotlib>=3.7"]
+
+[tool.setuptools]
+packages = ["jags"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
