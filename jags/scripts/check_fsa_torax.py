@@ -53,6 +53,7 @@ FIELDS = [
     "flux_surf_avg_grad_psi2_over_R2",
     "flux_surf_avg_B2", "flux_surf_avg_1_over_B2",
     "R_in", "R_out", "elongation", "Ip_profile", "Phi", "vpr",
+    "delta_upper_face", "delta_lower_face",
     "R_major", "a_minor", "B_0", "z_magnetic_axis",
 ]
 

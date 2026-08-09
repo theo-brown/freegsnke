@@ -115,6 +115,7 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 from jax.scipy.stats import norm
 
@@ -144,6 +145,12 @@ class FluxSurfaces(NamedTuple):
     avg_grad_psi: jnp.ndarray  # (n,) <|grad psi|>
     avg_grad_psi2: jnp.ndarray  # (n,) <|grad psi|^2>
     avg_grad_psi2_over_R2: jnp.ndarray  # (n,) <|grad psi|^2 / R^2>
+    R_in: jnp.ndarray  # (n,) innermost R on the surface [m]
+    R_out: jnp.ndarray  # (n,) outermost R on the surface [m]
+    Z_upper: jnp.ndarray  # (n,) highest Z on the surface [m]
+    Z_lower: jnp.ndarray  # (n,) lowest Z on the surface [m]
+    R_at_Z_upper: jnp.ndarray  # (n,) R where the surface is highest [m]
+    R_at_Z_lower: jnp.ndarray  # (n,) R where the surface is lowest [m]
     width: jnp.ndarray  # (n,) kernel width used [Wb/rad]
     n_cells: jnp.ndarray  # (n,) width in cells; < width_cells => edge cap bit
     n_eff: jnp.ndarray  # (n,) cells carrying the surface; small => unresolved
@@ -176,6 +183,7 @@ def make_flux_surface_averager(
     order: int = 4,
     max_span: float = 0.25,
     n_passes: int = 3,
+    sharpness: float = 6.0,
 ):
     """Build flux-surface-average machinery for a grid.
 
@@ -191,6 +199,14 @@ def make_flux_surface_averager(
     n_passes : iterations of the width fixed point. Two suffice; three makes the
         result seed-independent on coarse grids at the cost of one more kernel
         evaluation.
+    sharpness : inverse temperature of the soft extrema used for ``R_in``,
+        ``R_out`` and the ``Z`` extents, in units of 1/cell. An extremum is not
+        an average and has no co-area form, so these are the one part of the
+        bundle that is an approximation of a different kind: a Boltzmann
+        average over the surface at temperature ``cell / sharpness``, which
+        biases inward by O(cell / sharpness) and converges with the grid. They
+        exist because TORAX needs elongation and triangularity, which are
+        defined by extrema.
 
     Returns ``(average, surfaces, grad_psi)``:
 
@@ -216,6 +232,7 @@ def make_flux_surface_averager(
     contaminated by the softmin.
     """
     R = jnp.asarray(grid.R)
+    Z = jnp.asarray(grid.Z)
     dR, dZ, dA = float(grid.dR), float(grid.dZ), float(grid.dA)
     two_pi_R_dA = 2.0 * jnp.pi * R * dA
 
@@ -236,6 +253,33 @@ def make_flux_surface_averager(
             / (12 * dZ)
         )
         return gR, gZ
+
+    def _extremum(w, X, key, sign, scale):
+        """Boltzmann average of ``X`` over the surface, tilted towards an
+        extremum of ``key``. ``sign=+1`` picks the maximum, ``-1`` the minimum.
+
+        Weights are clamped non-negative first: the fourth-order kernel takes
+        negative values in its tails, which is harmless inside a co-area ratio
+        but would let the denominator here vanish.
+
+        The exp shift is taken over the cells that carry the surface, not over
+        the whole grid. Shifting by the global maximum of ``key`` puts every
+        in-surface cell at ``exp(-huge)``, so the ratio underflows to 0/0 and
+        the whole bundle goes NaN -- which it did, for any sharpness above ~10.
+        """
+        pos = jnp.maximum(w, 0.0)
+        t = sign * sharpness * key[..., None] / scale
+        shift = jnp.max(jnp.where(pos > 0, t, -jnp.inf), axis=(0, 1), keepdims=True)
+        # Clipped on both sides. Above: the shift is the maximum over cells
+        # that carry the surface, so cells beyond it -- outside the plasma,
+        # where ``pos`` is exactly 0 -- overflow to inf and give 0 * inf = NaN.
+        # Below: without a floor a large sharpness drives every term to
+        # exactly 0 and the ratio is 0/0. Both bite only for sharpness above
+        # ~10, which is why the default sits well below.
+        ww = pos * jnp.exp(
+            jnp.clip(t - jax.lax.stop_gradient(shift), -600.0, 0.0)
+        )
+        return jnp.sum(ww * X[..., None], axis=(0, 1)) / jnp.sum(ww, axis=(0, 1))
 
     def _weights(label, psi_levels, width, mask):
         """Surface weights and enclosed-volume weights, shape (nR, nZ, n).
@@ -330,6 +374,12 @@ def make_flux_surface_averager(
             avg_grad_psi=avg(grad),
             avg_grad_psi2=avg(grad2),
             avg_grad_psi2_over_R2=avg(grad2 / R**2),
+            R_in=_extremum(w, R, R, -1.0, dR),
+            R_out=_extremum(w, R, R, +1.0, dR),
+            Z_upper=_extremum(w, Z, Z, +1.0, dZ),
+            Z_lower=_extremum(w, Z, Z, -1.0, dZ),
+            R_at_Z_upper=_extremum(w, R, Z, +1.0, dZ),
+            R_at_Z_lower=_extremum(w, R, Z, -1.0, dZ),
             width=width,
             n_cells=width / avg(dpsi_cell),
             n_eff=norm_**2 / jnp.sum(w**2, axis=(0, 1)),

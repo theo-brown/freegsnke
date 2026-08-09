@@ -63,6 +63,28 @@ The bundle reports `n_eff` (cells actually carrying a surface) and `n_cells` alo
 so a caller can tell which surfaces to extrapolate rather than believe: above `n_eff = 80` every
 quantity is inside 1e-5, below 40 none is better than 1e-3.
 
+`torax_geom.py` assembles the whole of TORAX's `StandardGeometryIntermediates` from that bundle, in
+TORAX's names and COCOS 11 units. `scripts/check_torax_geometry.py` runs it field by field against
+TORAX's own eqdsk parser on the same ψ (193×193, median relative difference):
+
+| | |
+|---|---|
+| `psi`, `F` | exact (bookkeeping / given) |
+| `⟨\|∇ψ\|⟩`, `⟨\|∇ψ\|²⟩` | 4e-04, 6e-04 |
+| `⟨1/R⟩`, `⟨1/B²⟩`, `Phi` | 2e-03, 3e-03, 3e-03 |
+| `⟨1/R²⟩`, `⟨B²⟩`, `int_dl_over_Bp` | 4e-03, 4e-03, 4e-03 |
+| `⟨\|∇ψ\|²/R²⟩`, `vpr`, `Ip_profile` | 7e-03, 1e-02, 1e-02 |
+| `R_out`, `elongation`, `R_in` | 8e-03, 1e-02, 3e-02 |
+| `delta_upper/lower_face` | **1e-01** |
+
+The split is structural, not incidental. Everything the co-area formula computes as an **average**
+agrees to a few 1e-3 or better. The **shape** quantities do not: elongation, triangularity and
+`R_in`/`R_out` are defined by *extrema*, which have no co-area form, so they come from a Boltzmann
+average over the surface carrying ~1 cell of bias. Ratios cancel it (elongation is exact to 1e-4 on
+circular surfaces); triangularity is a difference of two nearby radii, so it does not, and it is the
+one field that should not be trusted from this route. TORAX's SOL fields (`connection_length_*`,
+`R_OMP`, …) have no jags counterpart and are `None` in TORAX's own eqdsk path too.
+
 ## Results
 
 Cross-checked against FreeGSNKE on MAST-U at 65×65 — identical grid, limiter, vacuum flux and
@@ -99,11 +121,13 @@ jags/
   solver.py     residual, Picard warm-up, exact Newton with Armijo; make_solver compiles once
   critical.py   diagnostics only: axis by implicit function theorem, soft-max boundary flux
   fsa.py        flux-surface averages by the co-area formula -- no contour tracing
+  torax_geom.py TORAX StandardGeometryIntermediates, assembled from the bundle
 scripts/
   dump_freegsnke_case.py   run in the FreeGSNKE venv -> .npz + .geqdsk reference
   compare.py               re-solve, report metrics, write the figure
   check_fsa_torax.py       run in the TORAX venv -> its eqdsk parser's own FSAs
   check_fsa.py             flux-surface averages vs both tracing codes
+  check_torax_geometry.py  every TORAX geometry field vs its eqdsk parser
 ```
 
 Everything geometry-only is precomputed in NumPy/SciPy and frozen as constants, so **JAX never needs
@@ -134,7 +158,7 @@ uv pip install --python .venv/bin/python jax jaxlib numpy scipy pytest matplotli
 uv venv --python 3.10 ../.venv-freegsnke
 uv pip install --python ../.venv-freegsnke/bin/python "freegs4e>=0.11" -e ..   # the repo root
 
-PYTHONPATH=. .venv/bin/python -m pytest tests -q     # 51 tests
+PYTHONPATH=. .venv/bin/python -m pytest tests -q     # 57 tests
 PYTHONPATH=. .venv/bin/python scripts/compare.py     # reference .npz files are committed
 PYTHONPATH=. .venv/bin/python scripts/check_fsa.py   # flux-surface averages
 
