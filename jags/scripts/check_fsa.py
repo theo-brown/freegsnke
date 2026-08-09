@@ -45,7 +45,6 @@ from jags import reach  # noqa: E402
 from jags.fsa import make_flux_surface_averager, safety_factor  # noqa: E402
 from jags.grid import Grid  # noqa: E402
 
-EPS = 0.01
 TWO_PI = 2.0 * np.pi
 
 # (label, npz, torax npz). The 65x65 pair is committed; the rest are produced by
@@ -80,7 +79,7 @@ def load(path):
     return d, grid
 
 
-def jags_surfaces(d, grid, levels, variant="label", eps=EPS):
+def jags_surfaces(d, grid, levels, variant="label"):
     """FluxSurfaces on given psi levels, by one of three level-set choices.
 
     A raw level set of psi is not one closed curve in a diverted equilibrium:
@@ -88,19 +87,19 @@ def jags_surfaces(d, grid, levels, variant="label", eps=EPS):
     ``label`` are the two ways of using ``reach.py`` to restrict to the core.
     """
     psi = jnp.asarray(d["psi"])
-    psi_bndry = float(d["psi_bndry"])
-    scale = abs(float(d["psi_axis"]) - psi_bndry)
+    psi_axis, psi_edge = float(d["psi_axis"]), float(d["psi_bndry"])
+    scale = abs(psi_axis - psi_edge)
 
-    _, surfaces, _ = make_flux_surface_averager(grid, eps=eps)
+    _, surfaces, _ = make_flux_surface_averager(grid)
     if variant == "raw":
-        return surfaces(psi, levels, scale)
+        return surfaces(psi, levels, psi_axis, psi_edge)
 
     m = reach.make_reachability(grid, n_samples=64, beta_norm=2e5)(psi)
     if variant == "mask":
-        mask = jax.nn.sigmoid((m - psi_bndry) / (0.02 * scale))
-        return surfaces(psi, levels, scale, mask=mask)
+        mask = jax.nn.sigmoid((m - psi_edge) / (0.02 * scale))
+        return surfaces(psi, levels, psi_axis, psi_edge, mask=mask)
     if variant == "label":
-        return surfaces(psi, levels, scale, label=m)
+        return surfaces(psi, levels, psi_axis, psi_edge, label=m)
     raise ValueError(variant)
 
 
@@ -144,7 +143,7 @@ def against_torax(d, grid, tx):
 
 def report(label, npz, torax_npz):
     d, grid = load(npz)
-    print(f"\n=== diverted, {int(d['nR'])}x{int(d['nZ'])}, eps={EPS} ===")
+    print(f"\n=== diverted, {int(d['nR'])}x{int(d['nZ'])} ===")
 
     pn, ref, out = against_freegs4e(d, grid)
     print("  vs FreeGS4E traced q")

@@ -27,7 +27,7 @@ from jags.reach import make_reachability  # noqa: E402
 
 R0 = 1.0
 BOX = np.array([[0.35, -0.6], [1.65, -0.6], [1.65, 0.6], [0.35, 0.6]])
-PSI_SCALE = 0.25
+PSI_EDGE = -0.25  # plasma is {psi > psi_edge}; the axis is at psi = 0
 
 
 def circular(n):
@@ -61,19 +61,19 @@ def test_average_of_unity_is_one(case):
     """
     g, m, psi_coil, _, psi0 = case
     psi = psi0.reshape(g.nR, g.nZ) + psi_coil
-    average, _, _ = make_flux_surface_averager(g, eps=0.02)
-    levels = jnp.linspace(float(psi.min()) * 0.5, float(psi.max()) * 0.9, 6)
-    got = average(psi, jnp.ones_like(psi), levels, float(jnp.ptp(psi)))
+    average, _, _ = make_flux_surface_averager(g)
+    lo, hi = float(psi.min()) * 0.5, float(psi.max()) * 0.9
+    levels = jnp.linspace(lo, hi, 6)
+    got = average(psi, jnp.ones_like(psi), levels, hi, lo)
     np.testing.assert_allclose(np.asarray(got), 1.0, rtol=1e-12)
 
 
-# Tolerances are per-quantity because they genuinely differ by two orders.
-# <|grad psi|> is the slow one: the measure grows like r across the kernel band,
-# biasing its centroid outward, which survives at O(eps^2 / r^2) for a quantity
-# linear in r. Squared and inverse quantities are far less affected.
+# Tolerances are per-quantity because they still differ by two orders, but all
+# of them tightened by 2-3 orders when the width moved from a fixed fraction of
+# the flux range to a fixed number of cells with a fourth-order kernel.
 @pytest.mark.parametrize(
     "quantity,tol",
-    [("avg_1_over_R2", 1e-4), ("avg_grad_psi2", 1e-3), ("avg_grad_psi", 1e-2)],
+    [("avg_1_over_R2", 1e-6), ("avg_grad_psi2", 1e-5), ("avg_grad_psi", 1e-4)],
 )
 def test_ratios_match_closed_form(quantity, tol):
     """<X> against closed form on resolved surfaces.
@@ -83,8 +83,8 @@ def test_ratios_match_closed_form(quantity, tol):
     the weighting were wrong.
     """
     g, psi = circular(129)
-    _, surfaces, _ = make_flux_surface_averager(g, eps=0.01)
-    fs = surfaces(psi, jnp.asarray(-(RESOLVED**2)), PSI_SCALE)
+    _, surfaces, _ = make_flux_surface_averager(g)
+    fs = surfaces(psi, jnp.asarray(-(RESOLVED**2)), 0.0, PSI_EDGE)
 
     want = np.array([exact(r)[quantity] for r in RESOLVED])
     err = np.max(np.abs(np.asarray(getattr(fs, quantity)) - want) / want)
@@ -93,52 +93,95 @@ def test_ratios_match_closed_form(quantity, tol):
 
 def test_enclosed_integrals_match_closed_form():
     g, psi = circular(129)
-    _, surfaces, _ = make_flux_surface_averager(g, eps=0.01)
-    fs = surfaces(psi, jnp.asarray(-(RESOLVED**2)), PSI_SCALE)
+    _, surfaces, _ = make_flux_surface_averager(g)
+    fs = surfaces(psi, jnp.asarray(-(RESOLVED**2)), 0.0, PSI_EDGE)
 
     for key in ("volume", "area"):
         want = np.array([exact(r)[key] for r in RESOLVED])
         got = np.asarray(getattr(fs, key))
-        assert np.max(np.abs(got - want) / want) < 1e-4, key
+        assert np.max(np.abs(got - want) / want) < 1e-6, key
 
 
 def test_absolute_contour_integral_is_the_weakest_quantity():
-    """``int_dl_over_Bp`` carries ~1%, an order worse than the ratios.
+    """``int_dl_over_Bp`` is still the weakest, but only by an order now.
 
-    Pinned rather than hidden: it is the one quantity whose kernel normalisation
-    does not cancel, and a coupled transport solve would inherit this error in
-    dV/dpsi. See the module docstring for why it cannot simply be tightened.
+    It is the one quantity whose kernel normalisation does not cancel, so it
+    cannot benefit from the ratio the way every ``<X>`` does, and a coupled
+    transport solve inherits it through ``dV/dpsi``. Both bounds are asserted:
+    the lower one fires if the gap ever closes, which would mean the docstring's
+    account of *why* it is weakest has gone stale.
     """
     g, psi = circular(129)
-    _, surfaces, _ = make_flux_surface_averager(g, eps=0.01)
-    fs = surfaces(psi, jnp.asarray(-(RESOLVED**2)), PSI_SCALE)
+    _, surfaces, _ = make_flux_surface_averager(g)
+    fs = surfaces(psi, jnp.asarray(-(RESOLVED**2)), 0.0, PSI_EDGE)
     err = np.max(np.abs(np.asarray(fs.int_dl_over_Bp) - np.pi * R0) / (np.pi * R0))
-    assert err < 2e-2
-    assert err > 1e-4, "if this is now tight, the docstring is stale"
+    ratio = np.max(np.abs(np.asarray(fs.avg_1_over_R2)
+                          - np.array([exact(r)["avg_1_over_R2"] for r in RESOLVED]))
+                   / np.array([exact(r)["avg_1_over_R2"] for r in RESOLVED]))
+    assert err < 1e-4
+    assert err > 10 * ratio, "no longer weakest -- the docstring is stale"
 
 
-def test_near_axis_surfaces_are_unresolved_and_refining_does_not_help():
-    """The innermost surfaces fail, and identically at both resolutions.
+def test_near_axis_surfaces_converge_with_resolution():
+    """The innermost surfaces are the hard ones, but they are *not* a dead end.
 
-    A surface of radius 0.03 spans ~3 cells at 129x129. The failure is that the
-    grid cannot represent the curve, not that the kernel is wrong -- which is
-    why doubling the resolution changes nothing. Documented so nobody trusts
-    the inner cells of a coupled transport grid.
+    With a fixed-width kernel this test asserted the opposite -- the error at
+    r = 0.03 was above 50% and identical at 65x65 and 129x129, so refining was
+    genuinely useless. Setting the width in cells changed that: the same surface
+    now converges, 3.9e-2 -> 1.7e-2 -> 3.2e-3 -> 2.9e-4 across 65/129/193/257.
+    Kept as a convergence test rather than deleted, because the earlier claim
+    was wrong and this is what disproves it.
     """
     errs = []
-    for n in (65, 129):
+    for n in (65, 129, 193, 257):
         g, psi = circular(n)
-        _, surfaces, _ = make_flux_surface_averager(g, eps=0.01)
-        fs = surfaces(psi, jnp.asarray([-(0.03**2)]), PSI_SCALE)
+        _, surfaces, _ = make_flux_surface_averager(g)
+        fs = surfaces(psi, jnp.asarray([-(0.03**2)]), 0.0, PSI_EDGE)
         errs.append(
             abs(float(fs.volume[0]) - exact(0.03)["volume"]) / exact(0.03)["volume"]
         )
 
-    assert errs[0] > 0.5, "expected the innermost surface to be badly wrong"
-    assert abs(errs[0] - errs[1]) / errs[0] < 0.05, (
-        f"refining changed the error {errs[0]:.3f} -> {errs[1]:.3f}, so this is "
-        "grid resolution after all and the docstring is wrong"
-    )
+    assert all(b < a for a, b in zip(errs, errs[1:])), f"not monotone: {errs}"
+    assert errs[-1] < 1e-3, f"257x257 should resolve r=0.03: {errs[-1]:.2e}"
+    assert errs[0] / errs[-1] > 50, f"barely converging: {errs}"
+
+
+def test_n_eff_predicts_whether_a_surface_can_be_trusted():
+    """The diagnostic has to earn its place by actually tracking the error.
+
+    ``n_eff`` is the participation ratio of the kernel weights -- how many cells
+    carry the surface. It is the number a coupled transport solve would use to
+    decide which inner surfaces to extrapolate instead of believe.
+    """
+    g, psi = circular(129)
+    _, surfaces, _ = make_flux_surface_averager(g)
+    radii = np.array([0.03, 0.05, 0.08, 0.12, 0.20, 0.30, 0.40])
+    fs = surfaces(psi, jnp.asarray(-(radii**2)), 0.0, PSI_EDGE)
+
+    n_eff = np.asarray(fs.n_eff)
+    want = np.array([exact(r)["volume"] for r in radii])
+    err = np.abs(np.asarray(fs.volume) - want) / want
+
+    assert np.all(np.diff(n_eff) > 0), "n_eff should grow outward"
+    assert err[n_eff > 80].max() < 1e-5, "well-sampled surfaces must be accurate"
+    assert err[n_eff < 40].max() > 1e-3, "starved surfaces must look starved"
+
+
+def test_a_level_on_the_plasma_edge_stays_finite():
+    """The separatrix itself must not poison the whole bundle with NaN.
+
+    The edge cap drives the width to zero for a level sitting exactly on
+    ``psi_edge``, where the true contour integral diverges anyway. Without a
+    floor that is a division by zero, and one bad level NaNs an entire coupled
+    solve, so the floor is not cosmetic.
+    """
+    g, psi = circular(65)
+    _, surfaces, _ = make_flux_surface_averager(g)
+    levels = jnp.asarray([PSI_EDGE, -(0.25**2), -(0.4**2)])
+    fs = surfaces(psi, levels, 0.0, PSI_EDGE)
+
+    for name, v in zip(fs._fields, fs):
+        assert np.all(np.isfinite(np.asarray(v))), name
 
 
 @pytest.mark.parametrize(
@@ -151,11 +194,11 @@ def test_differentiable_with_respect_to_psi(quantity):
     is what a coupled Newton solve would actually exercise.
     """
     g, psi = circular(65)
-    _, surfaces, _ = make_flux_surface_averager(g, eps=0.02)
+    _, surfaces, _ = make_flux_surface_averager(g)
     levels = jnp.asarray(-(np.array([0.18, 0.30]) ** 2))
 
     def scalar(p):
-        return jnp.sum(getattr(surfaces(p, levels, PSI_SCALE), quantity))
+        return jnp.sum(getattr(surfaces(p, levels, 0.0, PSI_EDGE), quantity))
 
     grad = np.asarray(jax.grad(scalar)(psi))
     assert np.all(np.isfinite(grad))
@@ -197,11 +240,11 @@ def test_diverted_level_sets_need_the_reachability():
     levels = jnp.asarray(pa + pn * (pb - pa))
     scale = abs(pa - pb)
 
-    _, surfaces, _ = make_flux_surface_averager(g, eps=0.01)
+    _, surfaces, _ = make_flux_surface_averager(g)
     m = make_reachability(g, n_samples=64, beta_norm=2e5)(psi)
 
     def err(**kw):
-        q = np.asarray(safety_factor(surfaces(psi, levels, scale, **kw),
+        q = np.asarray(safety_factor(surfaces(psi, levels, pa, pb, **kw),
                                      jnp.asarray(d["fpol"])))
         return float(np.median(np.abs(q - ref) / ref))
 
@@ -217,12 +260,12 @@ def test_diverted_level_sets_need_the_reachability():
 def test_mask_restricts_the_average(case):
     """A mask must exclude masked cells entirely, not merely downweight them."""
     g, psi = circular(65)
-    average, _, _ = make_flux_surface_averager(g, eps=0.02)
+    average, _, _ = make_flux_surface_averager(g)
     levels = jnp.asarray([-(0.25**2)])
 
     upper = jnp.asarray((g.Z > 0).astype(float))
-    both = average(psi, jnp.asarray(g.Z), levels, PSI_SCALE)
-    top = average(psi, jnp.asarray(g.Z), levels, PSI_SCALE, mask=upper)
+    both = average(psi, jnp.asarray(g.Z), levels, 0.0, PSI_EDGE)
+    top = average(psi, jnp.asarray(g.Z), levels, 0.0, PSI_EDGE, mask=upper)
 
     # <Z> vanishes by symmetry over the whole surface, but not over half of it.
     assert abs(float(both[0])) < 1e-12

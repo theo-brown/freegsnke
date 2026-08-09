@@ -37,19 +37,31 @@ formula turns them into ratios of *volume* integrals, `⟨X⟩ = Σwᵢxᵢ / Σ
 diverted plasma the level sets must be taken from the reachability rather than from ψ, or the kernel
 sums over the divertor legs too; `surfaces(..., label=m)` does that, keeping `|∇ψ|` physical.
 
+Three things decide whether it is accurate, and all three matter. The kernel width is set in
+**cells** (a multiple of the flux change across one cell along `∇ψ`, by a fixed point), not as a
+fraction of the flux range, which is grid-blind. The kernel is **fourth order**, so the O(w²)
+smearing of neighbouring surfaces cancels and the band can be a full cell wide; a Gaussian makes
+`enclosed = Φ(u) + uφ(u)/2` the exact antiderivative of the delta, so `dV/dψ` stays the exact
+derivative of `volume`. And the width is **capped near the edge**, where `|∇ψ|→0` at the X-point
+would otherwise make a fixed flux band unboundedly wide in space.
+
 Checked on the MAST-U diverted case against **two** contour-tracing codes — FreeGS4E's ray-traced
 `q` and TORAX's `contourpy`-based eqdsk parser — on the same ψ:
 
-| grid | jags vs FreeGS4E `q` | FreeGS4E vs TORAX `q` |
-|---|---|---|
-| 65×65 | 4.0e-02 | 2.2e-02 |
-| 129×129 | 9.1e-03 | 1.1e-02 |
-| 193×193 | **2.0e-03** | 9.4e-03 |
+| grid | jags vs FreeGS4E `q` | ψ_N ≤ 0.8 | FreeGS4E vs TORAX `q` |
+|---|---|---|---|
+| 65×65 | 3.7e-03 | 3.0e-02 | 2.2e-02 |
+| 129×129 | 1.2e-03 | 5.1e-03 | 1.1e-02 |
+| 193×193 | **1.2e-03** | **1.2e-03** | 9.4e-03 |
 
-(median relative error, `eps=0.01`). From 129 up jags sits inside the spread between the two
-references. Across the whole `FluxSurfaces` bundle at 193×193, over `0.2 ≤ ψ_N ≤ 0.8`, every quantity
-matches TORAX to 1.1e-2 or better. Outside that band both failure modes are real and documented in
-`fsa.py`: the innermost surfaces are unresolved by *any* grid method, and coarse grids alias.
+(median relative error). At 193×193 jags differs from TORAX by 8.8e-03 — *equal to* the
+TORAX–FreeGS4E spread, so the comparison has hit the floor set by the references. On analytic
+circular surfaces, where the truth is exact, the worst error over every quantity is 4.6e-04 / 3.1e-05
+/ 6.8e-06 at 65/129/193.
+
+The bundle reports `n_eff` (cells actually carrying a surface) and `n_cells` alongside the physics,
+so a caller can tell which surfaces to extrapolate rather than believe: above `n_eff = 80` every
+quantity is inside 1e-5, below 40 none is better than 1e-3.
 
 ## Results
 
@@ -122,7 +134,7 @@ uv pip install --python .venv/bin/python jax jaxlib numpy scipy pytest matplotli
 uv venv --python 3.10 ../.venv-freegsnke
 uv pip install --python ../.venv-freegsnke/bin/python "freegs4e>=0.11" -e ..   # the repo root
 
-PYTHONPATH=. .venv/bin/python -m pytest tests -q     # 49 tests
+PYTHONPATH=. .venv/bin/python -m pytest tests -q     # 51 tests
 PYTHONPATH=. .venv/bin/python scripts/compare.py     # reference .npz files are committed
 PYTHONPATH=. .venv/bin/python scripts/check_fsa.py   # flux-surface averages
 
