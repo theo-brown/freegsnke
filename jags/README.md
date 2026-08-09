@@ -77,6 +77,37 @@ TORAX's own eqdsk parser on the same ψ (193×193, median relative difference):
 | `R_out`, `elongation`, `R_in` | 8e-03, 1e-02, 3e-02 |
 | `delta_upper/lower_face` | **1e-01** |
 
+`torax_bridge.py` closes the loop: **loose coupling**, in the sense TORAX already
+supports for CHEASE/FBT/EQDSK — jags solves Grad–Shafranov, the geometry is frozen, TORAX evolves
+transport on it. The difference is only that the geometry arrives as arrays in memory rather than
+through a file, and that it came from a differentiable pipeline. jags runs inside TORAX's own venv,
+so it is one process:
+
+```python
+inter = torax_bridge.build_intermediates(grid, averager, psi, F_of_psi,
+                                         psi_axis, psi_edge, R_axis, Z_axis, label=m)
+provider = torax_bridge.geometry_provider(torax_bridge.build_geometry(inter))
+```
+
+`scripts/couple_torax.py` then checks the thing that actually matters — TORAX's *transport-facing*
+`StandardGeometry`, after it has interpolated onto its own ρ̂ grid and formed the metric
+coefficients, against the same object built from a geqdsk of the identical equilibrium (median
+relative difference):
+
+| | 65×65 | 193×193 |
+|---|---|---|
+| `g0` = ⟨\|∇V\|⟩ | 8.6e-03 | 3.1e-03 |
+| `g1` = ⟨(∇V)²⟩ | 1.7e-02 | 6.9e-03 |
+| `g2` = ⟨(∇V)²/R²⟩ | 3.1e-02 | 1.2e-02 |
+| `g3` = ⟨1/R²⟩ | 1.0e-02 | 3.4e-03 |
+| `vpr`, `spr` | 2.4e-02, 2.0e-02 | 1.1e-02, 9.6e-03 |
+| `Phi`, `volume` | 1.3e-02, 2.4e-02 | 7.4e-03, 1.2e-02 |
+
+The metric coefficients are *products* of averages — `g1 = ⟨\|∇ψ\|²⟩·(dV/dψ)²` — so they compound
+the per-surface error rather than inherit it, which is why they sit a factor of two or three above
+the intermediates they are built from. They converge; `a_minor` (3.0e-02, flat) and `R_in` do not,
+for the extrema reason above.
+
 The split is structural, not incidental. Everything the co-area formula computes as an **average**
 agrees to a few 1e-3 or better. The **shape** quantities do not: elongation, triangularity and
 `R_in`/`R_out` are defined by *extrema*, which have no co-area form, so they come from a Boltzmann
@@ -122,12 +153,15 @@ jags/
   critical.py   diagnostics only: axis by implicit function theorem, soft-max boundary flux
   fsa.py        flux-surface averages by the co-area formula -- no contour tracing
   torax_geom.py TORAX StandardGeometryIntermediates, assembled from the bundle
+  torax_bridge.py loose coupling: hand that to TORAX as its GeometryProvider
 scripts/
   dump_freegsnke_case.py   run in the FreeGSNKE venv -> .npz + .geqdsk reference
   compare.py               re-solve, report metrics, write the figure
   check_fsa_torax.py       run in the TORAX venv -> its eqdsk parser's own FSAs
   check_fsa.py             flux-surface averages vs both tracing codes
   check_torax_geometry.py  every TORAX geometry field vs its eqdsk parser
+  couple_torax.py          run TORAX on a jags equilibrium; compare what it sees
+  timing.py                runtime and memory vs grid size
 ```
 
 Everything geometry-only is precomputed in NumPy/SciPy and frozen as constants, so **JAX never needs
@@ -158,7 +192,7 @@ uv pip install --python .venv/bin/python jax jaxlib numpy scipy pytest matplotli
 uv venv --python 3.10 ../.venv-freegsnke
 uv pip install --python ../.venv-freegsnke/bin/python "freegs4e>=0.11" -e ..   # the repo root
 
-PYTHONPATH=. .venv/bin/python -m pytest tests -q     # 57 tests
+PYTHONPATH=. .venv/bin/python -m pytest tests -q     # 57 passed, 1 skipped (the TORAX bridge)
 PYTHONPATH=. .venv/bin/python scripts/compare.py     # reference .npz files are committed
 PYTHONPATH=. .venv/bin/python scripts/check_fsa.py   # flux-surface averages
 
