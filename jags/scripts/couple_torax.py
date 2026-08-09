@@ -75,25 +75,69 @@ def from_jags(npz, n_rho=N_RHO):
     return torax_bridge.build_geometry(inter), d
 
 
-def from_eqdsk(gfile, n_rho=N_RHO):
+def jags_from_eqdsk(gfile, cocos=11, n_rho=N_RHO):
+    """Run the jags geometry path on an eqdsk, without solving anything.
+
+    The FSA only needs psi on a grid, so any equilibrium file will do -- and
+    loading it through TORAX's own converter means both sides start from
+    bit-identical psi, which is the point: any difference is then the geometry
+    pipeline and nothing else.
+
+    jags carries psi in Wb/rad with the axis at the *maximum*, TORAX in COCOS 11
+    Wb growing outwards, so the mapping is psi_jags = -psi_torax / 2 pi.
+    """
+    from torax._src.geometry import eqdsk as torax_eqdsk
+
+    eq = torax_eqdsk._enforce_torax_sign_convention(
+        torax_eqdsk._convert_eqdsk_object_to_cocos11_dict(cocos, _load(gfile, cocos))
+    )
+    nR, nZ = int(eq["nx"]), int(eq["nz"])
+    Rmin, Rmax = float(eq["xgrid1"]), float(eq["xgrid1"] + eq["xdim"])
+    Zmid, Zdim = float(eq["zmid"]), float(eq["zdim"])
+    limiter = np.stack([np.asarray(eq["xlim"]), np.asarray(eq["zlim"])], axis=-1)
+    grid = Grid(Rmin, Rmax, Zmid - Zdim / 2, Zmid + Zdim / 2, nR, nZ, limiter)
+
+    psi = jnp.asarray(-np.asarray(eq["psi"]) / (2 * np.pi))
+    psi_axis = -float(eq["psimag"]) / (2 * np.pi)
+    psi_edge = -float(eq["psibdry"]) / (2 * np.pi)
+
+    averager = make_flux_surface_averager(grid)
+    label = reach.make_reachability(grid, n_samples=64, beta_norm=2e5)(psi)
+    axis, _ = critical.make_axis_finder(grid)[0](psi)
+
+    psi_1d = np.linspace(0.0, float(eq["psibdry"] - eq["psimag"]), nR)
+    fpol = np.asarray(eq["fpol"])
+
+    def F_of_psi(levels):
+        return np.interp((psi_axis - np.asarray(levels)) * 2 * np.pi, psi_1d, fpol)
+
+    inter = torax_bridge.build_intermediates(
+        grid, averager, psi, F_of_psi, psi_axis, psi_edge,
+        float(axis[0]), float(axis[1]),
+        n_surfaces=N_SURFACES, label=label, n_rho=n_rho,
+    )
+    return torax_bridge.build_geometry(inter)
+
+
+def from_eqdsk(gfile, cocos=7, n_rho=N_RHO):
     from torax._src.geometry import eqdsk as torax_eqdsk
 
     inter = torax_eqdsk._construct_intermediates_from_eqdsk(
         geometry_directory=None, geometry_file=None,
-        eqdsk_object=_load(gfile), hires_factor=4, Ip_from_parameters=False,
+        eqdsk_object=_load(gfile, cocos), hires_factor=4, Ip_from_parameters=False,
         face_centers=np.linspace(0.0, 1.0, n_rho + 1),
         n_surfaces=N_SURFACES, last_surface_factor=torax_bridge.LAST_SURFACE_FACTOR,
-        cocos=7,
+        cocos=cocos,
     )
     from torax._src.geometry import standard_geometry
 
     return standard_geometry.build_standard_geometry(inter)
 
 
-def _load(gfile):
+def _load(gfile, cocos=7):
     import eqdsk
 
-    return eqdsk.EQDSKInterface.from_file(gfile, from_cocos=7, no_cocos=False)
+    return eqdsk.EQDSKInterface.from_file(gfile, from_cocos=cocos, no_cocos=False)
 
 
 def compare(a, b, label_a="jags", label_b="eqdsk"):
@@ -138,9 +182,14 @@ def plot(rows, rho, out_path):
     print(f"\nwrote {out_path}")
 
 
-def main(npz, out_path):
-    geo_jags, _ = from_jags(npz)
-    geo_eqdsk = from_eqdsk(npz.replace(".npz", ".geqdsk"))
+def main(npz, out_path, cocos=None):
+    if npz.endswith(".eqdsk") or npz.endswith(".geqdsk"):
+        c = cocos or 11
+        geo_jags = jags_from_eqdsk(npz, cocos=c)
+        geo_eqdsk = from_eqdsk(npz, cocos=c)
+    else:
+        geo_jags, _ = from_jags(npz)
+        geo_eqdsk = from_eqdsk(npz.replace(".npz", ".geqdsk"), cocos=7)
     print(f"TORAX transport grid: {geo_jags.rho_norm.shape[0]} cells, "
           f"{N_SURFACES} flux surfaces from jags\n")
     rows = compare(geo_jags, geo_eqdsk)
@@ -152,4 +201,5 @@ if __name__ == "__main__":
     main(
         args[0] if args else "scripts/case_diverted.npz",
         args[1] if len(args) > 1 else "scripts/couple_torax.png",
+        int(args[2]) if len(args) > 2 else None,
     )
