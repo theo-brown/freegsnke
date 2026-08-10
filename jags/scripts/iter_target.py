@@ -18,6 +18,8 @@ import numpy as np
 
 EQDSK = "/home/user/torax/torax/data/third_party/geo/iterhybrid_cocos11.eqdsk"
 N_ISOFLUX = 24
+N_PSI_VALS = 600
+PSI_MARGIN = 0.3  # metres of vacuum around the target LCFS to also constrain
 
 
 def main(out_path="scripts/iter_target.npz", gfile=EQDSK):
@@ -39,10 +41,33 @@ def main(out_path="scripts/iter_target.npz", gfile=EQDSK):
     pick = order[np.linspace(0, len(order) - 1, N_ISOFLUX, dtype=int)]
     iso_R, iso_Z = Rb[pick], Zb[pick]
 
+    # The flux map itself, on a coarse grid over the plasma and a margin around
+    # it. Isoflux points only ask for equal flux among themselves, which leaves
+    # the solver free to put the separatrix somewhere else entirely; psi_vals
+    # pins the actual surface. Converted to the FreeGS4E convention -- Wb/rad,
+    # axis at the maximum -- since that is what the inverse solve compares
+    # against. FreeGSNKE subtracts the mean, so only sign and scale matter.
+    psi = np.asarray(d["psi"])
+    nx, nz = psi.shape
+    Rg = d["xgrid1"] + np.linspace(0.0, float(d["xdim"]), nx)
+    Zg = d["zmid"] - d["zdim"] / 2 + np.linspace(0.0, float(d["zdim"]), nz)
+    sign = 1.0 if d["psimag"] > d["psibdry"] else -1.0
+    psi_fg = sign * psi / (2 * np.pi)
+
+    inside = (
+        (Rg[:, None] > Rb.min() - PSI_MARGIN) & (Rg[:, None] < Rb.max() + PSI_MARGIN)
+        & (Zg[None, :] > Zb.min() - PSI_MARGIN) & (Zg[None, :] < Zb.max() + PSI_MARGIN)
+    )
+    iR, iZ = np.nonzero(inside)
+    step = max(1, len(iR) // N_PSI_VALS)
+    iR, iZ = iR[::step], iZ[::step]
+    psi_R, psi_Z, psi_V = Rg[iR], Zg[iZ], psi_fg[iR, iZ]
+
     np.savez_compressed(
         out_path,
         lcfs_R=Rb, lcfs_Z=Zb,
         isoflux_R=iso_R, isoflux_Z=iso_Z,
+        psi_R=psi_R, psi_Z=psi_Z, psi_V=psi_V,
         Rx=Rx, Zx=Zx, R_axis=R_axis, Z_axis=Z_axis,
         Ip=abs(float(d["cplasma"])),
         fvac=float(d["bcentre"] * d["xcentre"]),
@@ -61,6 +86,8 @@ def main(out_path="scripts/iter_target.npz", gfile=EQDSK):
     print(f"  p_axis    = {float(np.asarray(d['pressure'])[0]):.4e} Pa")
     print(f"  {N_ISOFLUX} isoflux points, R {iso_R.min():.3f}-{iso_R.max():.3f}, "
           f"Z {iso_Z.min():.3f}-{iso_Z.max():.3f}")
+    print(f"  {len(psi_R)} psi_vals points, psi {psi_V.min():.4f}-{psi_V.max():.4f} "
+          f"Wb/rad (sign {sign:+.0f}, axis at the maximum)")
 
 
 if __name__ == "__main__":

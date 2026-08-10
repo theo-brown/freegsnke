@@ -63,6 +63,7 @@ import pathlib
 import sys
 
 import numpy as np
+from scipy.interpolate import RectBivariateSpline
 
 FREEGSNKE = pathlib.Path(__file__).resolve().parents[2]
 MACHINE = f"{FREEGSNKE}/machine_configs/ITER"
@@ -125,34 +126,46 @@ def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"
         )
         # How well the achieved boundary matches the target: normalised flux at
         # the target separatrix points, which should all be 1.
-        pn = (eq.psi_func(Rb, Zb, grid=False) - eq.psi_axis) / (
-            eq.psi_bndry - eq.psi_axis
+        #
+        # Sampled from eq.psi() through a fresh spline rather than eq.psi_func.
+        # psi_func lags the solve -- FreeGSNKE prints "Discrepancy between
+        # psi_func and plasma_psi detected" and re-sets it -- and reading it here
+        # gave a mean of 0.07 where the converged field gives 1.16, which is the
+        # difference between rejecting a good solve and accepting a bad one.
+        sp = RectBivariateSpline(
+            np.linspace(RMIN, RMAX, NGRID), np.linspace(ZMIN, ZMAX, NGRID), eq.psi()
         )
+        pn = (sp(Rb, Zb, grid=False) - eq.psi_axis) / (eq.psi_bndry - eq.psi_axis)
         act = {k: v for k, v in eq.tokamak.getCurrents().items()
                if not str(k).startswith(("I", "O"))}
+        xpt = np.asarray(eq.xpt)
         return eq, profiles, solver, float(np.std(pn)), float(np.mean(pn)), \
-            max(abs(v) for v in act.values())
+            max(abs(v) for v in act.values()), \
+            (float(xpt[0][1]) if len(xpt) else float("nan"))
 
-    def describe(e, sd, mean, maxI):
+    def describe(e, sd, mean, maxI, xz):
         return (f"vol={e.plasmaVolume():>8.1f} m3  "
                 f"diverted={str(not bool(e.flag_limiter)):<5}  "
-                f"max|I_active|={maxI:.2e} A  "
+                f"max|I_active|={maxI:.2e} A  X-pt Z={xz:>6.2f}  "
                 f"psiN at target LCFS: mean {mean:.3f} sd {sd:.3f}")
 
     if sweep:
         print("l2_reg sweep (diagnostic only -- L2_REG is what gets used):")
         for l2 in SWEEP:
-            e, _, _, sd, mean, maxI = attempt(l2, SEEDS[0])
-            print(f"  l2={l2:.0e}  {describe(e, sd, mean, maxI)}")
+            e, _, _, sd, mean, maxI, xz = attempt(l2, SEEDS[0])
+            print(f"  l2={l2:.0e}  {describe(e, sd, mean, maxI, xz)}")
 
     print(f"inverse solve, l2_reg = {L2_REG:.0e}, trying seeds until the target "
           f"boundary is hit ...")
     best = None
     for seed in SEEDS:
-        eq, profiles, solver, sd, mean, maxI = attempt(L2_REG, seed)
+        eq, profiles, solver, sd, mean, maxI, xz = attempt(L2_REG, seed)
+        # The X-point must be the lower one: ITER is a lower single null, and an
+        # over-regularised solve happily returns a healthy upper-null plasma of
+        # entirely the wrong shape.
         ok = (not bool(eq.flag_limiter) and abs(mean - 1.0) < MAX_MEAN_ERR
-              and sd < MAX_SD)
-        print(f"  seed={seed}  {describe(eq, sd, mean, maxI)}  "
+              and sd < MAX_SD and xz < 0.0)
+        print(f"  seed={seed}  {describe(eq, sd, mean, maxI, xz)}  "
               f"{'ACCEPTED' if ok else 'rejected'}")
         if ok:
             best = (0.0, seed, eq, profiles, solver)
