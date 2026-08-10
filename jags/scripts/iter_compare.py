@@ -71,14 +71,24 @@ def run(npz):
     )
 
     value, _, _ = make_interpolator(grid)
-    c = critical.make_critical_fns(grid)(res.psi, beta_norm=20000.0, use_limiter=False)
+    # Take the boundary the way the reference case is configured. jags defaults
+    # to psi_bndry = max(psi_xpt, max psi on the limiter), which is FreeGSNKE's
+    # definition; use_limiter=False is right for a *diverted* plasma, where jags
+    # maximises over the whole limiter contour while FreeGSNKE restricts to cells
+    # adjacent to the core. This ITER case is limited, and taking the X-point
+    # flux there made jags' axis-to-edge span 11% wider than FreeGSNKE's, so the
+    # TORAX geometry was traced out past the real plasma edge.
+    limited = bool(d["flag_limiter"])
+    c = critical.make_critical_fns(grid)(
+        res.psi, beta_norm=20000.0, use_limiter=limited
+    )
     return dict(
         d=d, grid=grid, res=res, limiter=limiter, profile=profile,
         psi=np.asarray(res.psi), ref_psi=np.asarray(d["psi"]),
         jtor=np.asarray(res.jtor), ref_jtor=ref_j, Ip=Ip,
         psi_axis=psi_axis, psi_edge=psi_edge,
         axis=np.asarray(c.axis), xpts=np.asarray(c.xpoints),
-        psi_x=float(value(res.psi, c.xpoints[0])),
+        psi_x=float(c.psi_bndry),   # the boundary flux, however it is set
         psi_axis_jags=float(value(res.psi, c.axis)),
     )
 
