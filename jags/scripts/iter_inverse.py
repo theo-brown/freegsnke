@@ -35,6 +35,33 @@ limiter, which is not a boundary any plasma can have. The solve then builds
 something in the upper half of the vessel instead. Every "wrong shape" result
 before that shift was this, and no amount of retuning ``l2_reg`` addressed it.
 
+**What still does not work, and what has been ruled out.** The solve converges
+to an ITER-scale plasma with the axis within 1 cm of the target and Ip exact,
+but it is *limited*: the boundary is a few per cent inside the requested
+separatrix and the divertor leg never forms. Four axes were tested against it,
+and none is the explanation:
+
+* vertical position -- fixed (see above); the axis now lands within 1 cm.
+* regularisation -- 1e-11 to 1e-8 at 65^2 and 129^2. Only 1e-8 gives both
+  convergence and sane currents; everything smaller reaches 1e6-1e8 A, fails to
+  converge, or both.
+* resolution -- 65/129/257. psiN at the target separatrix goes 1.119 -> 1.072
+  -> 1.080, so it plateaus. What resolution *does* fix is the null structure:
+  65^2 finds only a spurious upper null at +4.54, 129^2 one below the vessel
+  floor, and only 257^2 a genuine lower X-point, at Z = -2.43 against the
+  requested -3.412.
+* target size -- scaling the separatrix about its axis by 0.97/0.94/0.90 walks
+  the mean psiN to 1.014 but makes the spread worse (0.093 -> 0.106) and never
+  diverts, even with three times the wall clearance.
+
+So it is not that the plasma does not fit: at best clearance the separatrix
+clears the wall by 0.108 m, which is only 0.69 grid cells at 65^2, but tripling
+that clearance does not change the outcome. The remaining untested candidates
+are inside FreeGSNKE's optimiser rather than in the problem statement -- the
+relative weighting of the X-point null against the 24 isoflux constraints, the
+passive-structure currents (all zero in every solve here), and whether VS3
+should be removed from the control set as the example hints.
+
 The solve is mildly **nondeterministic** at 129^2: when successive residuals come
 out collinear, ``GSstaticsolver`` restarts the Krylov space along a direction
 built from ``np.random.random()`` (``freegsnke/GSstaticsolver.py:557-570``). Six
