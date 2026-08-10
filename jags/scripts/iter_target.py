@@ -29,12 +29,22 @@ N_ISOFLUX = 24
 # plasma can sit. The solve then builds one in the upper half of the vessel
 # instead, which is what the "wrong shape" was.
 #
-# The offset is read off FreeGSNKE's own reference equilibrium for this machine
-# (example08): it places the O-point at Z = +0.66 and the X-point at Z = -3.23,
-# against 0.00 and -3.91 here. Two independent points giving +0.66 and +0.68 is
-# a rigid vertical shift, so 0.67 m it is. That puts the X-point 1.33 m above the
-# vessel floor, where ITER's belongs.
-Z_OFFSET = 0.67
+# The offset is fixed by the vessel, not by taste. Sweeping it and measuring the
+# smallest clearance between the shifted separatrix and the limiter polygon:
+#
+#   dZ       0.00  0.30   0.35   0.50   0.60   0.67   0.75   0.80
+#   clear    out   out    0.001  0.108  0.108  ~0.08  0.022  out
+#
+# "out" means part of the separatrix is outside the vessel. It only fits at all
+# for dZ in [0.35, 0.75] -- a 0.4 m window -- and the clearance peaks at
+# 0.50-0.60. ITER's design magnetic axis height is Z0 = +0.5 m, the same answer
+# from a different direction, so +0.50 is what is used.
+#
+# FreeGSNKE's own example implies +0.66 (its O-point is at Z = +0.66 against 0.00
+# here). That was the first value tried and it is worse evidence: the example
+# does not converge, and +0.67 leaves only ~0.08 m at the top wall, which pushes
+# the solve into a limited plasma against it.
+Z_OFFSET = 0.50
 N_PSI_VALS = 600
 PSI_MARGIN = 0.3  # metres of vacuum around the target LCFS to also constrain
 
