@@ -236,6 +236,16 @@ checkouts cannot be installed together. The commands above take `freegs4e` from 
   `n⁴`: 0.13 GB at 65×65, 0.66 GB at 97×97, ~2.1 GB at 129×129, ~10.6 GB at 193×193. Building it is
   `O(N² log N)` — a *sparse* LU plus N back-substitutions, not a dense inversion — measured `n^4.2`.
   See `scripts/timing.py`.
+- **The FSA is wrong on a coarse limited plasma.** On the ITER case at 65×65 the extensive
+  quantities — volume, area, `Phi`, `vpr`, `spr`, `g1`, `g2` — come out ~20% high against TORAX's
+  contour tracer *starting from the identical psi*, while the ratio-like ones (`g3` = ⟨1/R²⟩, `gm4`,
+  `F`) stay at 1e-3. It is jags that is wrong, not the tracer: jags reports 778 m³ inside a surface
+  strictly within a plasma whose total volume is 711 m³ by direct contour integration, which is
+  impossible. For scale, the same pipeline on the same ITER equilibrium at 129×129 agrees to
+  **9.5e-4** on volume and **7.0e-4** on `vpr`, and MAST-U diverted at 65×65 to 2.4e-2. So it is not
+  simply cell count — ITER at 65² has *more* cells across the minor radius than MAST-U — and the
+  limited configuration, whose outer surfaces sit against the limiter, is the likely trigger. Until
+  this is understood, treat the co-area FSA as unvalidated for limited plasmas below ~129×129.
 - **X-point diagnostics** seed one saddle above and below the axis; multi-X-point configurations are
   out of scope. `critical.boundary_flux` also maximises over the whole limiter contour where
   FreeGSNKE restricts to cells adjacent to the core — pass `use_limiter=False` when diverted.
