@@ -30,6 +30,16 @@ Two settings differ from FreeGSNKE's example and both matter:
   built from boundary flux alone prefers 1e-9, which has a visibly worse
   boundary and larger currents.
 
+The inverse solve is **not deterministic**. When successive residuals come out
+collinear, ``GSstaticsolver`` restarts the Krylov space along a direction built
+from ``np.random.random()`` (``freegsnke/GSstaticsolver.py:557-570``), so the
+same settings reach a diverted ~670 m^3 plasma on one run and collapse to ~5 m^3
+on the next. That is not something to average over: a collapsed result is simply
+wrong. So the RNG is seeded, each seed is checked against the target boundary,
+and the first one that actually achieves the requested shape is kept. The
+accepted seed is recorded in the .npz, which is what makes the case
+reproducible.
+
 The inverse solve finds coil currents. Those currents are then used for an
 ordinary forward solve, dumped in the same format as ``dump_freegsnke_case.py``
 so jags can be pointed at it unchanged.
@@ -67,6 +77,13 @@ ALPHA_M, ALPHA_N, BETAP, PROFILE_RAXIS = 2.0, 1, 0.15, 1.0
 L2_REG = 1e-8
 SWEEP = (1e-9, 1e-8, 1e-7)
 
+# Seeds tried in order; the first that achieves the target boundary is kept.
+SEEDS = (0, 1, 2, 3, 4, 5)
+# Acceptance: normalised flux at the 24 target separatrix points should be 1
+# everywhere. A collapsed solve misses by a factor of a few, so this is a wide
+# gate that only has to separate "solved the right problem" from "did not".
+MAX_MEAN_ERR, MAX_SD = 0.15, 0.15
+
 
 def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz",
          sweep=False):
@@ -78,13 +95,8 @@ def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"
     Ip, fvac = float(t["Ip"]), float(t["fvac"])
     Rb, Zb = np.asarray(t["lcfs_R"]), np.asarray(t["lcfs_Z"])
 
-    tokamak = build_machine.tokamak(
-        active_coils_path=f"{MACHINE}/ITER_active_coils.pickle",
-        passive_coils_path=f"{MACHINE}/ITER_passive_coils.pickle",
-        limiter_path=f"{MACHINE}/ITER_limiter.pickle",
-        wall_path=f"{MACHINE}/ITER_wall.pickle",
-    )
-    def attempt(l2):
+    def attempt(l2, seed):
+        np.random.seed(seed)
         eq = equilibrium_update.Equilibrium(
             tokamak=build_machine.tokamak(
                 active_coils_path=f"{MACHINE}/ITER_active_coils.pickle",
@@ -121,18 +133,44 @@ def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"
         return eq, profiles, solver, float(np.std(pn)), float(np.mean(pn)), \
             max(abs(v) for v in act.values())
 
+    def describe(e, sd, mean, maxI):
+        return (f"vol={e.plasmaVolume():>8.1f} m3  "
+                f"diverted={str(not bool(e.flag_limiter)):<5}  "
+                f"max|I_active|={maxI:.2e} A  "
+                f"psiN at target LCFS: mean {mean:.3f} sd {sd:.3f}")
+
     if sweep:
         print("l2_reg sweep (diagnostic only -- L2_REG is what gets used):")
         for l2 in SWEEP:
-            e, _, _, sd, mean, maxI = attempt(l2)
-            print(f"  l2={l2:.0e}  vol={e.plasmaVolume():>8.1f} m3  "
-                  f"diverted={not bool(e.flag_limiter)}  max|I_active|={maxI:.2e} A  "
-                  f"psiN at target LCFS: mean {mean:.3f} sd {sd:.3f}")
+            e, _, _, sd, mean, maxI = attempt(l2, SEEDS[0])
+            print(f"  l2={l2:.0e}  {describe(e, sd, mean, maxI)}")
 
-    print(f"inverse solve, l2_reg = {L2_REG:.0e} ...")
-    eq, profiles, solver, sd, mean, maxI = attempt(L2_REG)
-    print(f"  vol={eq.plasmaVolume():.1f} m3  diverted={not bool(eq.flag_limiter)}  "
-          f"max|I_active|={maxI:.2e} A  psiN at target LCFS: mean {mean:.3f} sd {sd:.3f}")
+    print(f"inverse solve, l2_reg = {L2_REG:.0e}, trying seeds until the target "
+          f"boundary is hit ...")
+    best = None
+    for seed in SEEDS:
+        eq, profiles, solver, sd, mean, maxI = attempt(L2_REG, seed)
+        ok = (not bool(eq.flag_limiter) and abs(mean - 1.0) < MAX_MEAN_ERR
+              and sd < MAX_SD)
+        print(f"  seed={seed}  {describe(eq, sd, mean, maxI)}  "
+              f"{'ACCEPTED' if ok else 'rejected'}")
+        if ok:
+            best = (0.0, seed, eq, profiles, solver)
+            break
+        score = abs(mean - 1.0) + sd
+        if best is None or score < best[0]:
+            best = (score, seed, eq, profiles, solver)
+    else:
+        print(f"  no seed met the acceptance gate; keeping the closest "
+              f"(seed {best[1]}), which is NOT a usable ITER equilibrium")
+    accepted, seed, eq, profiles, solver = best[0] == 0.0, *best[1:]
+    print(f"  using seed {seed}")
+    if not accepted:
+        # Writing to the usual name would let stages 2 and 3 run on a collapsed
+        # plasma and report differences that mean nothing.
+        out_path = str(out_path).replace(".npz", "_rejected.npz")
+        print(f"  writing to {out_path} instead, so nothing downstream picks it up")
+
     currents = eq.tokamak.getCurrents()
     print("  active coil currents [A]:")
     for k, v in currents.items():
@@ -145,6 +183,7 @@ def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"
     # here destroys the plasma.
     Beta0 = float(profiles.Beta0)
     print(f"forward solve, Fiesta_Topeol with Beta0 = {Beta0:.6f} ...")
+    np.random.seed(seed)  # the forward solver draws from the same RNG
     profiles = Fiesta_Topeol(
         eq=eq, Beta0=Beta0, Ip=Ip, fvac=fvac,
         alpha_m=ALPHA_M, alpha_n=ALPHA_N, Raxis=PROFILE_RAXIS,
@@ -178,7 +217,7 @@ def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"
         flag_limiter=eq.flag_limiter, opt=eq.opt, xpt=eq.xpt,
         L=profiles.L, Beta0=profiles.Beta0, Ip=Ip, fvac=fvac,
         alpha_m=ALPHA_M, alpha_n=ALPHA_N, profile_Raxis=PROFILE_RAXIS,
-        betap=BETAP, l2_reg=L2_REG,
+        betap=BETAP, l2_reg=L2_REG, seed=seed,
         psinorm=psinorm, q=q, fpol=np.asarray(eq.fpol(psinorm)),
         plasma_volume=eq.plasmaVolume(),
         coil_names=np.array(list(currents), dtype=object),
