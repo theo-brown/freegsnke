@@ -25,14 +25,28 @@ Two settings differ from FreeGSNKE's example and both matter:
 * ``l2_reg`` is 1e-8, not the example's 1e-14. Unregularised, the optimiser
   finds coil currents of order a gigaamp and a plasma of a few cubic metres;
   at 1e-8 the peak active current is a few MA and the plasma is a diverted
-  ~670 m^3. The value is chosen by the sweep below rather than asserted.
+  ~670 m^3. Pass ``--sweep`` to print the neighbouring decades rather than take
+  that on trust; the value is fixed rather than auto-selected, because a score
+  built from boundary flux alone prefers 1e-9, which has a visibly worse
+  boundary and larger currents.
 
 The inverse solve finds coil currents. Those currents are then used for an
-ordinary forward solve, dumped in the same format as
-``dump_freegsnke_case.py`` so jags can be pointed at it unchanged.
+ordinary forward solve, dumped in the same format as ``dump_freegsnke_case.py``
+so jags can be pointed at it unchanged.
+
+The forward solve switches the profile to ``Fiesta_Topeol``, holding ``Beta0``
+fixed at whatever the inverse solve converged to. This is not cosmetic.
+``ConstrainBetapIp`` re-solves for ``Beta0`` at every forward iteration to hold
+betap at the constrained Ip, and that inner solve is unstable here: it drives
+``Beta0`` negative, which sends ``F^2 = fvac^2 + 2 mu0 L (1 - Beta0) Raxis I``
+below zero and collapses the plasma to a few cells. With ``Beta0`` frozen the
+same currents converge in 7 Newton steps to 7.2e-10 and land 2.3e-4 away from
+the inverse solution, as they should -- the inverse solution *is* the forward
+solution. Fixing ``Beta0`` also makes stage 2 a fair test, since jags' ``topeol``
+is the same fixed two-term form with no inner constraint solve of its own.
 
 Usage:
-    <freegsnke-venv>/bin/python scripts/iter_inverse.py [target.npz] [out.npz]
+    <freegsnke-venv>/bin/python scripts/iter_inverse.py [target.npz] [out.npz] [--sweep]
 """
 
 import pathlib
@@ -50,13 +64,15 @@ RMIN, RMAX, ZMIN, ZMAX, NGRID = 3.2, 8.8, -5.0, 5.0, 129
 # Topeol shape parameters, from FreeGSNKE's ITER example. alpha_n must stay an
 # integer for jags' topeol to have a closed-form antiderivative.
 ALPHA_M, ALPHA_N, BETAP, PROFILE_RAXIS = 2.0, 1, 0.15, 1.0
-L2_REGS = (1e-9, 1e-8, 1e-7)
+L2_REG = 1e-8
+SWEEP = (1e-9, 1e-8, 1e-7)
 
 
-def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"):
+def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz",
+         sweep=False):
     from freegsnke import GSstaticsolver, build_machine, equilibrium_update
     from freegsnke.inverse import Inverse_optimizer
-    from freegsnke.jtor_update import ConstrainBetapIp
+    from freegsnke.jtor_update import ConstrainBetapIp, Fiesta_Topeol
 
     t = np.load(target_path)
     Ip, fvac = float(t["Ip"]), float(t["fvac"])
@@ -105,18 +121,18 @@ def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"
         return eq, profiles, solver, float(np.std(pn)), float(np.mean(pn)), \
             max(abs(v) for v in act.values())
 
-    print("inverse solve, sweeping l2_reg ...")
-    best = None
-    for l2 in L2_REGS:
-        eq, profiles, solver, sd, mean, maxI = attempt(l2)
-        print(f"  l2={l2:.0e}  vol={eq.plasmaVolume():>8.1f} m3  "
-              f"diverted={not bool(eq.flag_limiter)}  max|I_active|={maxI:.2e} A  "
-              f"psiN at target LCFS: mean {mean:.3f} sd {sd:.3f}")
-        score = abs(mean - 1.0) + sd
-        if best is None or score < best[0]:
-            best = (score, l2, eq, profiles, solver)
-    _, l2_best, eq, profiles, solver = best
-    print(f"  chosen l2_reg = {l2_best:.0e}")
+    if sweep:
+        print("l2_reg sweep (diagnostic only -- L2_REG is what gets used):")
+        for l2 in SWEEP:
+            e, _, _, sd, mean, maxI = attempt(l2)
+            print(f"  l2={l2:.0e}  vol={e.plasmaVolume():>8.1f} m3  "
+                  f"diverted={not bool(e.flag_limiter)}  max|I_active|={maxI:.2e} A  "
+                  f"psiN at target LCFS: mean {mean:.3f} sd {sd:.3f}")
+
+    print(f"inverse solve, l2_reg = {L2_REG:.0e} ...")
+    eq, profiles, solver, sd, mean, maxI = attempt(L2_REG)
+    print(f"  vol={eq.plasmaVolume():.1f} m3  diverted={not bool(eq.flag_limiter)}  "
+          f"max|I_active|={maxI:.2e} A  psiN at target LCFS: mean {mean:.3f} sd {sd:.3f}")
     currents = eq.tokamak.getCurrents()
     print("  active coil currents [A]:")
     for k, v in currents.items():
@@ -124,8 +140,15 @@ def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"
             print(f"    {k:<10} {v:>14.4e}")
 
     # Forward solve with those currents, so the equilibrium being compared is
-    # one both codes can reproduce from the same vacuum flux.
-    print("forward solve ...")
+    # one both codes can reproduce from the same vacuum flux. Beta0 is frozen at
+    # the inverse solve's value -- see the module docstring for why re-solving it
+    # here destroys the plasma.
+    Beta0 = float(profiles.Beta0)
+    print(f"forward solve, Fiesta_Topeol with Beta0 = {Beta0:.6f} ...")
+    profiles = Fiesta_Topeol(
+        eq=eq, Beta0=Beta0, Ip=Ip, fvac=fvac,
+        alpha_m=ALPHA_M, alpha_n=ALPHA_N, Raxis=PROFILE_RAXIS,
+    )
     solver.solve(eq=eq, profiles=profiles, constrain=None,
                  target_relative_tolerance=1e-9, verbose=False)
 
@@ -155,7 +178,7 @@ def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"
         flag_limiter=eq.flag_limiter, opt=eq.opt, xpt=eq.xpt,
         L=profiles.L, Beta0=profiles.Beta0, Ip=Ip, fvac=fvac,
         alpha_m=ALPHA_M, alpha_n=ALPHA_N, profile_Raxis=PROFILE_RAXIS,
-        betap=BETAP, l2_reg=l2_best,
+        betap=BETAP, l2_reg=L2_REG,
         psinorm=psinorm, q=q, fpol=np.asarray(eq.fpol(psinorm)),
         plasma_volume=eq.plasmaVolume(),
         coil_names=np.array(list(currents), dtype=object),
@@ -173,7 +196,9 @@ def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"
 
 
 if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
     main(
-        sys.argv[1] if len(sys.argv) > 1 else "scripts/iter_target.npz",
-        sys.argv[2] if len(sys.argv) > 2 else "scripts/case_iter.npz",
+        args[0] if args else "scripts/iter_target.npz",
+        args[1] if len(args) > 1 else "scripts/case_iter.npz",
+        sweep="--sweep" in sys.argv,
     )

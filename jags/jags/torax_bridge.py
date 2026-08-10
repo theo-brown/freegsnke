@@ -94,6 +94,7 @@ def build_intermediates(
     n_rho=25,
     hires_factor=4,
     last_surface_factor=LAST_SURFACE_FACTOR,
+    Ip_from_parameters=False,
 ):
     """A TORAX ``StandardGeometryIntermediates`` from a jags psi field.
 
@@ -107,6 +108,10 @@ def build_intermediates(
         strictly better than reading a geqdsk.
     label : the reachability field, for a diverted equilibrium. Without it the
         outer surfaces pick up the divertor legs; see ``fsa.py``.
+    Ip_from_parameters : whether TORAX should rescale psi so the plasma current
+        matches the one in its own config rather than the one in this geometry.
+        Left False so the handoff is faithful by default; set it to match the
+        eqdsk path when the two are being compared.
     """
     import jax.numpy as jnp
     from torax._src.geometry import geometry, standard_geometry
@@ -137,7 +142,7 @@ def build_intermediates(
     # from the axis, so shifting is not needed, only the prepended zero.
     return standard_geometry.StandardGeometryIntermediates(
         geometry_type=geometry.GeometryType.EQDSK,
-        Ip_from_parameters=False,
+        Ip_from_parameters=Ip_from_parameters,
         R_major=np.asarray(ours.R_major, dtype=float),
         a_minor=np.asarray(ours.a_minor, dtype=float),
         B_0=np.asarray(ours.B_0, dtype=float),

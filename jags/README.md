@@ -162,6 +162,10 @@ scripts/
   check_torax_geometry.py  every TORAX geometry field vs its eqdsk parser
   couple_torax.py          run TORAX on a jags equilibrium; compare what it sees
   timing.py                runtime and memory vs grid size
+  iter_target.py           TORAX venv -> the ITER hybrid shape target, from TORAX's own eqdsk
+  iter_inverse.py          FreeGSNKE venv -> inverse solve to that shape, then forward solve
+  iter_compare.py          the same forward solve in jags, side by side
+  iter_torax.py            TORAX venv -> the ITER scenario on all three geometries
 ```
 
 Everything geometry-only is precomputed in NumPy/SciPy and frozen as constants, so **JAX never needs
@@ -208,6 +212,14 @@ cd /tmp && ../.venv-freegsnke/bin/python <repo>/jags/scripts/dump_freegsnke_case
 <torax>/.venv/bin/python scripts/check_fsa_torax.py \
     scripts/case_diverted.geqdsk /tmp/torax_diverted_65.npz
 PYTHONPATH=. .venv/bin/python scripts/check_fsa.py --all
+
+# the ITER pipeline, in order. Stage 1 is slow -- an ITER inverse solve at 129^2
+# is tens of minutes -- so case_iter.npz is committed and stage 1 only needs
+# rerunning if the target or the profile changes.
+<torax>/.venv/bin/python scripts/iter_target.py             # shape target
+../.venv-freegsnke/bin/python scripts/iter_inverse.py       # coils, then forward
+PYTHONPATH=. .venv/bin/python scripts/iter_compare.py       # jags forward, side by side
+PYTHONPATH=. <torax>/.venv/bin/python scripts/iter_torax.py # transport on all three
 ```
 
 `jax.config.update("jax_enable_x64", True)` is required — in float32 Newton stalls near 1e-4.
