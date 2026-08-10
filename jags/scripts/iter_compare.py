@@ -87,10 +87,10 @@ def q_profile(r, psinorm):
     """jags' safety factor on the same psiN grid FreeGSNKE reported."""
     grid, psi = r["grid"], jnp.asarray(r["psi"])
     pa, pb = r["psi_axis"], r["psi_edge"]
-    averager = make_flux_surface_averager(grid)
+    _, surfaces, _ = make_flux_surface_averager(grid)
     label = reach.make_reachability(grid, n_samples=64, beta_norm=2e5)(psi)
     levels = jnp.asarray(pa + (pb - pa) * np.asarray(psinorm))
-    fs = averager.surfaces(psi, levels, pa, pb, label=label)
+    fs = surfaces(psi, levels, pa, pb, label=label)
     F = r["profile"].F(levels)
     return np.asarray(torax_geom.safety_factor(fs, F)), np.asarray(fs.n_eff)
 

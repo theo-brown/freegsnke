@@ -91,10 +91,16 @@ SEEDS = (0, 1, 2, 3, 4, 5)
 
 # Two different questions, kept apart on purpose.
 #
-# Usable: is this a converged, diverted, ITER-scale equilibrium that a forward
-# solve can reproduce? That is all stages 2 and 3 need, and it gates the run --
-# a collapsed 5 m^3 plasma with gigaamp currents is simply wrong.
-MIN_VOLUME, MAX_CURRENT = 300.0, 3e7
+# Usable: a converged ITER-scale plasma, in the right place, on currents a real
+# coilset could carry. That is all stages 2 and 3 need, and it gates the run --
+# a collapsed 5 m^3 plasma, or one held by 91 MA, is simply wrong.
+#
+# Being diverted is deliberately *not* required. At the corrected offset the best
+# converged solve is limited: the boundary tracks the target across the top and
+# outboard side but stops short of the X-point, so there are no divertor legs.
+# That is a real equilibrium and a fair thing to compare two solvers on; it is
+# simply not the full CHEASE separatrix, which the report says.
+MIN_VOLUME, MAX_CURRENT, MAX_AXIS_ERR = 300.0, 3e7, 0.35
 # Faithful: does it match the CHEASE separatrix this target came from? Reported
 # and stored, never fatal, because with this machine description it is not
 # achievable -- see the module docstring.
@@ -160,29 +166,45 @@ def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"
             max(abs(v) for v in act.values()), \
             (float(xpt[0][1]) if len(xpt) else float("nan"))
 
-    def describe(e, sd, mean, maxI, xz):
-        return (f"vol={e.plasmaVolume():>8.1f} m3  "
-                f"diverted={str(not bool(e.flag_limiter)):<5}  "
-                f"max|I_active|={maxI:.2e} A  X-pt Z={xz:>6.2f}  "
-                f"psiN at target LCFS: mean {mean:.3f} sd {sd:.3f}")
+    def volume_of(profiles):
+        """2 pi R dA over the current-carrying cells.
+
+        eq.plasmaVolume() raises an object-dtype error whenever the critical
+        point search has left limiter_core_mask unset, which is exactly the
+        broken solves this gate exists to catch.
+        """
+        jt = np.asarray(profiles.jtor, dtype=float)
+        if not np.isfinite(jt).all() or jt.max() <= 0:
+            return 0.0
+        R2d = np.linspace(RMIN, RMAX, NGRID)[:, None] * np.ones((1, NGRID))
+        dA = ((RMAX - RMIN) / (NGRID - 1)) * ((ZMAX - ZMIN) / (NGRID - 1))
+        return float((2 * np.pi * R2d * (jt > 1e-3 * jt.max())).sum() * dA)
+
+    def describe(vol, e, sd, mean, maxI, xz, az):
+        return (f"vol={vol:>7.1f} m3  diverted={str(not bool(e.flag_limiter)):<5}  "
+                f"max|I|={maxI:.2e} A  axis Z={az:>5.2f}  X-pt Z={xz:>6.2f}  "
+                f"psiN: mean {mean:.3f} sd {sd:.3f}")
 
     if sweep:
         print("l2_reg sweep (diagnostic only -- L2_REG is what gets used):")
         for l2 in SWEEP:
-            e, _, _, sd, mean, maxI, xz = attempt(l2, SEEDS[0])
-            print(f"  l2={l2:.0e}  {describe(e, sd, mean, maxI, xz)}")
+            e, pr, _, sd, mean, maxI, xz = attempt(l2, SEEDS[0])
+            az = float(np.asarray(e.opt)[0][1]) if len(np.asarray(e.opt)) else np.nan
+            print(f"  l2={l2:.0e}  {describe(volume_of(pr), e, sd, mean, maxI, xz, az)}")
 
     print(f"inverse solve, l2_reg = {L2_REG:.0e}, trying seeds until one gives a "
           f"usable equilibrium ...")
+    Z_target = float(t["Z_axis"])
     best = None
     for seed in SEEDS:
         eq, profiles, solver, sd, mean, maxI, xz = attempt(L2_REG, seed)
-        usable = (not bool(eq.flag_limiter) and eq.plasmaVolume() > MIN_VOLUME
-                  and maxI < MAX_CURRENT)
-        # ITER is a lower single null, so a positive X-point Z is by itself
-        # proof the achieved shape is not the target's.
+        opt = np.asarray(eq.opt)
+        az = float(opt[0][1]) if len(opt) else float("nan")
+        vol = volume_of(profiles)
+        usable = (vol > MIN_VOLUME and maxI < MAX_CURRENT
+                  and abs(az - Z_target) < MAX_AXIS_ERR)
         faithful = abs(mean - 1.0) < MAX_MEAN_ERR and sd < MAX_SD and xz < 0.0
-        print(f"  seed={seed}  {describe(eq, sd, mean, maxI, xz)}  "
+        print(f"  seed={seed}  {describe(vol, eq, sd, mean, maxI, xz, az)}  "
               f"{'usable' if usable else 'UNUSABLE'}"
               f"{', matches target' if faithful else ''}")
         if usable or best is None:
@@ -200,10 +222,12 @@ def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"
         out_path = str(out_path).replace(".npz", "_rejected.npz")
         print(f"  writing to {out_path} instead, so nothing downstream picks it up")
     elif not faithful:
-        print("  NOTE: this is a converged, diverted, ITER-scale equilibrium of "
-              "the FreeGSNKE ITER\n        machine, but it is NOT the CHEASE "
-              "separatrix -- see the module docstring.\n        Stages 2 and 3 "
-              "compare solvers on it; they do not validate the shape.")
+        print(f"  NOTE: converged ITER-scale equilibrium with its axis "
+              f"{abs(az - Z_target):.2f} m from the target's,\n        but not the "
+              f"CHEASE separatrix: psiN there is {mean:.3f} +- {sd:.3f} rather "
+              f"than 1, and\n        the boundary is "
+              f"{'limited' if eq.flag_limiter else 'diverted'}. Stages 2 and 3 "
+              f"compare solvers on it;\n        they do not validate the shape.")
 
     currents = eq.tokamak.getCurrents()
     print("  active coil currents [A]:")
@@ -254,7 +278,7 @@ def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"
         betap=BETAP, l2_reg=L2_REG, seed=seed,
         matches_chease_target=faithful,
         psinorm=psinorm, q=q, fpol=np.asarray(eq.fpol(psinorm)),
-        plasma_volume=eq.plasmaVolume(),
+        plasma_volume=volume_of(profiles),
         coil_names=np.array(list(currents), dtype=object),
         coil_currents=np.array([currents[k] for k in currents]),
         target_lcfs_R=t["lcfs_R"], target_lcfs_Z=t["lcfs_Z"],
@@ -265,7 +289,7 @@ def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz"
     print(f"  limiter configuration : {bool(eq.flag_limiter)}")
     print(f"  psi_axis  = {eq.psi_axis:.6f}   psi_bndry = {eq.psi_bndry:.6f}")
     print(f"  Ip        = {profiles.jtor.sum() * dA:.6e}  (target {Ip:.6e})")
-    print(f"  volume    = {eq.plasmaVolume():.4f} m^3")
+    print(f"  volume    = {volume_of(profiles):.4f} m^3")
     print(f"  q(0.05..0.95) = {np.array2string(q, precision=3)}")
 
 
