@@ -18,6 +18,23 @@ import numpy as np
 
 EQDSK = "/home/user/torax/torax/data/third_party/geo/iterhybrid_cocos11.eqdsk"
 N_ISOFLUX = 24
+
+# The CHEASE file is in a PLASMA-CENTRED frame, not ITER machine coordinates:
+# its magnetic axis sits at Z = -0.0000 exactly, and its "limiter" is five points
+# describing the grid bounding box rather than a first wall. FreeGSNKE's ITER
+# machine is in machine coordinates -- a real wall from Z = -4.574 to +4.720.
+#
+# Dropping the separatrix in unshifted puts the requested X-point at Z = -3.91,
+# only 0.66 m above the vessel floor and down among the divertor tiles, where no
+# plasma can sit. The solve then builds one in the upper half of the vessel
+# instead, which is what the "wrong shape" was.
+#
+# The offset is read off FreeGSNKE's own reference equilibrium for this machine
+# (example08): it places the O-point at Z = +0.66 and the X-point at Z = -3.23,
+# against 0.00 and -3.91 here. Two independent points giving +0.66 and +0.68 is
+# a rigid vertical shift, so 0.67 m it is. That puts the X-point 1.33 m above the
+# vessel floor, where ITER's belongs.
+Z_OFFSET = 0.67
 N_PSI_VALS = 600
 PSI_MARGIN = 0.3  # metres of vacuum around the target LCFS to also constrain
 
@@ -26,8 +43,10 @@ def main(out_path="scripts/iter_target.npz", gfile=EQDSK):
     import eqdsk
 
     d = eqdsk.EQDSKInterface.from_file(gfile, from_cocos=11, no_cocos=False).__dict__
-    Rb, Zb = np.asarray(d["xbdry"]), np.asarray(d["zbdry"])
-    R_axis, Z_axis = float(d["xmag"]), float(d["zmag"])
+    # Everything vertical is shifted into machine coordinates here, once, so
+    # nothing downstream has to remember to do it. See Z_OFFSET above.
+    Rb, Zb = np.asarray(d["xbdry"]), np.asarray(d["zbdry"]) + Z_OFFSET
+    R_axis, Z_axis = float(d["xmag"]), float(d["zmag"]) + Z_OFFSET
 
     # The X-point is the bottom of the separatrix: this is a lower single null.
     ix = int(np.argmin(Zb))
@@ -50,7 +69,8 @@ def main(out_path="scripts/iter_target.npz", gfile=EQDSK):
     psi = np.asarray(d["psi"])
     nx, nz = psi.shape
     Rg = d["xgrid1"] + np.linspace(0.0, float(d["xdim"]), nx)
-    Zg = d["zmid"] - d["zdim"] / 2 + np.linspace(0.0, float(d["zdim"]), nz)
+    Zg = (d["zmid"] - d["zdim"] / 2 + np.linspace(0.0, float(d["zdim"]), nz)
+          + Z_OFFSET)
     sign = 1.0 if d["psimag"] > d["psibdry"] else -1.0
     psi_fg = sign * psi / (2 * np.pi)
 
@@ -68,7 +88,12 @@ def main(out_path="scripts/iter_target.npz", gfile=EQDSK):
         lcfs_R=Rb, lcfs_Z=Zb,
         isoflux_R=iso_R, isoflux_Z=iso_Z,
         psi_R=psi_R, psi_Z=psi_Z, psi_V=psi_V,
-        Rx=Rx, Zx=Zx, R_axis=R_axis, Z_axis=Z_axis,
+        # the whole CHEASE map, so the equilibrium can be plotted alongside the
+        # two solves without needing the eqdsk reader (a different venv)
+        map_R=Rg, map_Z=Zg, map_psi=psi_fg,
+        map_psi_axis=sign * float(d["psimag"]) / (2 * np.pi),
+        map_psi_bndry=sign * float(d["psibdry"]) / (2 * np.pi),
+        Rx=Rx, Zx=Zx, R_axis=R_axis, Z_axis=Z_axis, Z_offset=Z_OFFSET,
         Ip=abs(float(d["cplasma"])),
         fvac=float(d["bcentre"] * d["xcentre"]),
         B_0=float(d["bcentre"]), R_0=float(d["xcentre"]),
@@ -79,7 +104,8 @@ def main(out_path="scripts/iter_target.npz", gfile=EQDSK):
     print(f"wrote {out_path}")
     print(f"  Ip        = {abs(float(d['cplasma'])):.4e} A")
     print(f"  fvac      = {float(d['bcentre'] * d['xcentre']):.4f} m T")
-    print(f"  axis      = ({R_axis:.4f}, {Z_axis:.4f})")
+    print(f"  axis      = ({R_axis:.4f}, {Z_axis:.4f})   [Z shifted by "
+          f"{Z_OFFSET:+.2f} m into machine coordinates]")
     print(f"  X-point   = ({Rx:.4f}, {Zx:.4f})")
     print(f"  R_geo, a  = {(Rb.max() + Rb.min()) / 2:.4f}, "
           f"{(Rb.max() - Rb.min()) / 2:.4f}")

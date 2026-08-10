@@ -25,41 +25,23 @@ Two settings differ from FreeGSNKE's example and both matter:
 * ``l2_reg`` is 1e-8, not the example's 1e-14, because at 1e-14 nothing in this
   environment converges. Pass ``--sweep`` to see it.
 
-**The equilibrium this produces is not the CHEASE separatrix, and cannot be.**
-That is worth stating plainly, because everything downstream inherits it.
+The target arrives already shifted into machine coordinates by
+``iter_target.py``. This matters more than anything else here. The CHEASE file
+is plasma-centred -- its axis is at Z = -0.0000 and its "limiter" is the grid
+bounding box -- while the FreeGSNKE ITER machine has a real wall running from
+Z = -4.574 to +4.720. Used unshifted, the requested separatrix has its X-point
+down inside the divertor cassette and its lower outboard flank *outside* the
+limiter, which is not a boundary any plasma can have. The solve then builds
+something in the upper half of the vessel instead. Every "wrong shape" result
+before that shift was this, and no amount of retuning ``l2_reg`` addressed it.
 
-Measured, at seed 0 (``psiN`` is normalised flux at the 24 target separatrix
-points, which should be 1 everywhere; ``sd`` is how equipotential they are):
-
-  l2_reg    vol   diverted  max|I|   psiN mean   sd     axis Z  X-pt Z  converged
-  1e-14   368.5     no      9.7e8      1.166    0.028   -0.81   -3.64     no
-  1e-12   285.3     no      3.4e7      1.875    0.660   -0.01   +4.28     no
-  1e-8    671.9    yes      5.7e6      1.156    0.199   +0.71   +4.30    yes
-
-It is a regularisation bind. At 1e-14 the shape is nearly right -- the isoflux
-points are equipotential to sd 0.028 and the X-point is the lower one, as ITER's
-is -- but the coil currents reach a gigaamp and the solve does not converge. At
-1e-8 it converges cleanly on a few MA and builds an *upper*-null plasma sitting
-0.71 m too high. Nothing between the two worked.
-
-This is not specific to the CHEASE target. Running FreeGSNKE's own ITER example
-verbatim through the same path gives 1.90e+09 A, an upper X-point at Z = +3.11,
-and no convergence (3.0e-01 after 100 iterations). The CHEASE target is in fact
-the best-conditioned of the three shapes tried. So the obstacle is the coil
-least-squares in this installation -- FreeGSNKE 2.0 asks for ``freegs4e~=0.10``
-and 0.13.1 is what is installed -- rather than anything about the target.
-
-What this script therefore delivers is a converged, diverted, ITER-scale
-equilibrium *of the FreeGSNKE ITER machine*, carrying TORAX's Ip and fvac. That
-is enough for stages 2 and 3, which compare two solvers on one problem; it is
-not a validated reproduction of the ITER hybrid shape, and the run says so.
-
-The solve is also mildly **nondeterministic**: when successive residuals come out
-collinear, ``GSstaticsolver`` restarts the Krylov space along a direction built
-from ``np.random.random()`` (``freegsnke/GSstaticsolver.py:557-570``). Six seeds
-gave the same 672 m^3 answer and one earlier run collapsed to 5.6 m^3, so the
-collapse is rare rather than typical -- but the RNG is seeded and the seed
-recorded, because a case that cannot be reproduced is not a reference.
+The solve is mildly **nondeterministic** at 129^2: when successive residuals come
+out collinear, ``GSstaticsolver`` restarts the Krylov space along a direction
+built from ``np.random.random()`` (``freegsnke/GSstaticsolver.py:557-570``). Six
+seeds gave the same 672 m^3 answer there and one earlier run collapsed to
+5.6 m^3, so the collapse is rare rather than typical. At 65^2 the restart never
+triggers and all six seeds are identical. The RNG is seeded and the seed
+recorded either way, because a case that cannot be reproduced is not a reference.
 
 The inverse solve finds coil currents. Those currents are then used for an
 ordinary forward solve, dumped in the same format as ``dump_freegsnke_case.py``
@@ -91,7 +73,12 @@ MACHINE = f"{FREEGSNKE}/machine_configs/ITER"
 
 # Grid from FreeGSNKE's own ITER example. The target separatrix spans
 # R 4.21-8.19, Z -3.91 to 3.56, so it sits inside with room for the legs.
-RMIN, RMAX, ZMIN, ZMAX, NGRID = 3.2, 8.8, -5.0, 5.0, 129
+# NGRID must be 2**n + 1 for FreeGSNKE, so 65, 129 or 257. 65 is the default
+# because the jags forward solve in stage 2 stores a dense N x N inverse: 0.13 GB
+# at 65^2 but 2.28 GB at 129^2, and JAX captures that as a lowering constant and
+# copies it, which took 15.2 GB and killed the machine.
+RMIN, RMAX, ZMIN, ZMAX = 3.2, 8.8, -5.0, 5.0
+NGRID = 65
 
 # Topeol shape parameters, from FreeGSNKE's ITER example. alpha_n must stay an
 # integer for jags' topeol to have a closed-form antiderivative.
@@ -115,7 +102,9 @@ MAX_MEAN_ERR, MAX_SD = 0.05, 0.05
 
 
 def main(target_path="scripts/iter_target.npz", out_path="scripts/case_iter.npz",
-         sweep=False):
+         sweep=False, ngrid=None):
+    global NGRID
+    NGRID = ngrid or NGRID
     from freegsnke import GSstaticsolver, build_machine, equilibrium_update
     from freegsnke.inverse import Inverse_optimizer
     from freegsnke.jtor_update import ConstrainBetapIp, Fiesta_Topeol
@@ -286,4 +275,6 @@ if __name__ == "__main__":
         args[0] if args else "scripts/iter_target.npz",
         args[1] if len(args) > 1 else "scripts/case_iter.npz",
         sweep="--sweep" in sys.argv,
+        ngrid=next((int(a.split("=")[1]) for a in sys.argv if a.startswith("--ngrid=")),
+                   None),
     )
