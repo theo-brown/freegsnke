@@ -45,7 +45,14 @@ HERE = pathlib.Path(__file__).resolve().parent
 ORIGINAL = "iterhybrid_cocos11.eqdsk"
 
 N_SURFACES = 60
-LAST_SURFACE_FACTOR = 0.95
+# 0.85, not the 0.95 the MAST-U coupling uses. The FreeGSNKE and jags ITER
+# equilibria are *limited*, so their outermost surfaces run into the limiter and
+# TORAX's contour tracer stops producing closed contours: at 0.95 and 0.90 it
+# fails on surfaces 55-59 of 60 with "Volumes are not monotonically increasing".
+# The same value is used for all three geometries -- including the CHEASE one,
+# which is happy at 0.95 -- because a comparison in which the runs traced
+# different fractions of the plasma would not be measuring the equilibrium.
+LAST_SURFACE_FACTOR = 0.85
 IP_FROM_PARAMETERS = True
 T_FINAL = 5.0
 
