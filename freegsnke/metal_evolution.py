@@ -54,10 +54,6 @@ from .nk_solver_H import nksolver
 _MIN_RELATIVE_ADVANCE = 1e-8
 # floor for the norms used to make the residuals relative
 _NORM_FLOOR = 1e-300
-# static solver settings used unless overridden through `solver_kwargs`
-_DEFAULT_STATIC_SOLVER_KWARGS = dict(
-    max_n_directions=32, target_relative_unexplained_residual=0.1
-)
 # a step is also accepted when the residual is this small relative to the
 # metal currents themselves (e.g. a stationary state, where the increment is 0)
 _ABSOLUTE_TOLERANCE_FACTOR = 1e-3
@@ -220,13 +216,7 @@ class MetalCurrentsEvolution:
             coil_index = int(vertical_control[0])
             if not 0 <= coil_index < eq.tokamak.n_active_coils:
                 raise ValueError("vertical_control coil_index must be an active coil.")
-        # Profiles handed over by a transport code do not vanish at the
-        # separatrix, so the current density jumps across the LCFS; the static
-        # Newton-Krylov solver needs more Krylov directions than its defaults
-        # to converge such equilibria reliably.
-        self.solver_kwargs = dict(_DEFAULT_STATIC_SOLVER_KWARGS)
-        if solver_kwargs is not None:
-            self.solver_kwargs.update(solver_kwargs)
+        self.solver_kwargs = {} if solver_kwargs is None else dict(solver_kwargs)
         self.verbose = verbose
 
         self.limiter_handler = eq.limiter_handler

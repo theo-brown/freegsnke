@@ -69,10 +69,10 @@ except ImportError as error:  # pragma: no cover - exercised only without torax
 _MIN_RELATIVE_DT = 1e-8
 # floor for the profile norms used to make the convergence residual relative
 _RESIDUAL_NORM_FLOOR = 1e-300
-# static solver settings used unless overridden through `solver_kwargs`
-_DEFAULT_STATIC_SOLVER_KWARGS = dict(
-    max_n_directions=32, target_relative_unexplained_residual=0.1
-)
+# width (in normalised flux) of the layer over which the p' and FF' received
+# from TORAX are brought to zero at the separatrix (see
+# `imas_read_write.read_profiles_from_equilibrium_ids`)
+DEFAULT_EDGE_TAPER_WIDTH = 0.02
 
 
 def _require_torax():
@@ -141,6 +141,7 @@ class StaticEquilibriumSolver:
         Raxis=1.0,
         Ip_logic=True,
         interpolator="univariate_spline",
+        edge_taper_width=DEFAULT_EDGE_TAPER_WIDTH,
     ):
         """
         Parameters
@@ -175,6 +176,10 @@ class StaticEquilibriumSolver:
             current exactly.
         interpolator : str
             Interpolator used by `GeneralPprimeFFprime`.
+        edge_taper_width : float
+            Width in normalised flux over which the received p' and FF' are
+            brought to zero at the separatrix (0 disables it). See
+            `imas_read_write.read_profiles_from_equilibrium_ids`.
         """
         self.eq = eq
         self.profiles = profiles
@@ -183,12 +188,8 @@ class StaticEquilibriumSolver:
         self.psi_n = default_psi_n_grid() if psi_n is None else np.asarray(psi_n)
         self.fvac = profiles.fvac() if fvac is None else fvac
         self.target_relative_tolerance = target_relative_tolerance
-        # transport-code profiles do not vanish at the separatrix (the current
-        # density jumps across the LCFS), which needs more Krylov directions
-        # than the static solver's defaults to converge reliably
-        self.solver_kwargs = dict(_DEFAULT_STATIC_SOLVER_KWARGS)
-        if solver_kwargs is not None:
-            self.solver_kwargs.update(solver_kwargs)
+        self.solver_kwargs = {} if solver_kwargs is None else dict(solver_kwargs)
+        self.edge_taper_width = edge_taper_width
         self.Raxis = Raxis
         self.Ip_logic = Ip_logic
         self.interpolator = interpolator
@@ -242,7 +243,9 @@ class StaticEquilibriumSolver:
         """
         if isinstance(self.profiles, GeneralPprimeFFprime):
             imas_read_write.update_profiles_from_equilibrium_ids(
-                self.profiles, equilibrium_ids
+                self.profiles,
+                equilibrium_ids,
+                edge_taper_width=self.edge_taper_width,
             )
         else:
             self.profiles = imas_read_write.profiles_from_equilibrium_ids(
@@ -252,6 +255,7 @@ class StaticEquilibriumSolver:
                 Raxis=self.Raxis,
                 Ip_logic=self.Ip_logic,
                 interpolator=self.interpolator,
+                edge_taper_width=self.edge_taper_width,
             )
         self.set_coil_currents(time)
         self.solver.solve(
@@ -276,19 +280,25 @@ class StaticEquilibriumSolver:
         """Accepts the last solve (no state to keep for the static solver)."""
 
 
-def _interpolated_profile_update(ids_start, ids_end, t_start, t_end):
+def _interpolated_profile_update(
+    ids_start, ids_end, t_start, t_end, edge_taper_width=0.0
+):
     """
     Returns `update_profiles(profiles, time)` setting the plasma current and
     the p', FF' profiles of a `GeneralPprimeFFprime` object by linear
     interpolation in time between two equilibrium IDSs (each read in
-    FreeGSNKE's conventions). The profiles are interpolated on the normalised
-    flux grid of `ids_end`.
+    FreeGSNKE's conventions, with the edge taper applied). The profiles are
+    interpolated on the normalised flux grid of `ids_end`.
     """
-    end = imas_read_write.read_profiles_from_equilibrium_ids(ids_end)
+    end = imas_read_write.read_profiles_from_equilibrium_ids(
+        ids_end, edge_taper_width=edge_taper_width
+    )
     if ids_start is None or t_end <= t_start:
         start = end
     else:
-        start = imas_read_write.read_profiles_from_equilibrium_ids(ids_start)
+        start = imas_read_write.read_profiles_from_equilibrium_ids(
+            ids_start, edge_taper_width=edge_taper_width
+        )
     psi_n = end["psi_n"]
     pprime_start = np.interp(psi_n, start["psi_n"], start["pprime"])
     ffprime_start = np.interp(psi_n, start["psi_n"], start["ffprime"])
@@ -343,6 +353,7 @@ class EvolutiveEquilibriumSolver:
         Raxis=1.0,
         Ip_logic=True,
         interpolator="univariate_spline",
+        edge_taper_width=DEFAULT_EDGE_TAPER_WIDTH,
         verbose=False,
         **evolution_kwargs,
     ):
@@ -376,6 +387,10 @@ class EvolutiveEquilibriumSolver:
             Vacuum field function R*Btor [T m]; defaults to `profiles.fvac()`.
         Raxis, Ip_logic, interpolator
             Passed to `GeneralPprimeFFprime`.
+        edge_taper_width : float
+            Width in normalised flux over which the received p' and FF' are
+            brought to zero at the separatrix (0 disables it). See
+            `imas_read_write.read_profiles_from_equilibrium_ids`.
         verbose : bool
             Print information on each vessel sub-step.
         **evolution_kwargs
@@ -385,6 +400,7 @@ class EvolutiveEquilibriumSolver:
         self.eq = eq
         self.psi_n = default_psi_n_grid() if psi_n is None else np.asarray(psi_n)
         self.fvac = profiles.fvac() if fvac is None else fvac
+        self.edge_taper_width = edge_taper_width
         self.initial_profiles = profiles
         if isinstance(profiles, GeneralPprimeFFprime):
             self.profiles = profiles
@@ -443,7 +459,11 @@ class EvolutiveEquilibriumSolver:
         self.evolution.restore(self.committed_state)
         t_start = self.committed_state.time
         update_profiles = _interpolated_profile_update(
-            self.committed_ids, equilibrium_ids, t_start, time
+            self.committed_ids,
+            equilibrium_ids,
+            t_start,
+            time,
+            edge_taper_width=self.edge_taper_width,
         )
         if time - t_start < _MIN_RELATIVE_DT * self.evolution.vessel_timestep:
             self.evolution.resolve_static(update_profiles=update_profiles)

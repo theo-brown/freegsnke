@@ -550,6 +550,31 @@ def load_equilibrium_ids(path):
         return db_entry.get("equilibrium")
 
 
+def edge_taper(psi_n, width):
+    """
+    Smooth factor going from 1 to 0 over the outermost `width` of normalised
+    flux (a cubic smoothstep in (1 - psi_n) / width), used to bring profiles
+    that do not vanish at the separatrix smoothly to zero there.
+
+    Parameters
+    ----------
+    psi_n : np.array
+        Normalised poloidal flux values.
+    width : float
+        Width of the layer in normalised flux; 0 disables the taper.
+
+    Returns
+    -------
+    np.array
+        The taper factor at each value of `psi_n`.
+    """
+    psi_n = np.asarray(psi_n, dtype=float)
+    if width <= 0.0:
+        return np.ones_like(psi_n)
+    s = np.clip((1.0 - psi_n) / width, 0.0, 1.0)
+    return s * s * (3.0 - 2.0 * s)
+
+
 def _strictly_increasing(psi_n):
     """
     Returns a copy of `psi_n` with any non-increasing steps removed (a strictly
@@ -564,7 +589,7 @@ def _strictly_increasing(psi_n):
     return psi_n
 
 
-def read_profiles_from_equilibrium_ids(ids, slice_index=0):
+def read_profiles_from_equilibrium_ids(ids, slice_index=0, edge_taper_width=0.0):
     """
     Extracts the p' and FF' profiles (and the associated scalars) from an IMAS
     `equilibrium` IDS in FreeGSNKE's conventions, ready to be used with a
@@ -584,6 +609,15 @@ def read_profiles_from_equilibrium_ids(ids, slice_index=0):
         The `equilibrium` IDS.
     slice_index : int
         Index of the time slice to read.
+    edge_taper_width : float
+        If positive, p' and FF' are brought smoothly to zero over the
+        outermost `edge_taper_width` of normalised flux (see `edge_taper`).
+        Profiles from transport codes are generally finite at the separatrix,
+        which makes the current density jump across the last closed flux
+        surface; FreeGSNKE's static solver cannot resolve such a jump on its
+        grid and may stall, whereas its own profile models vanish there. The
+        total plasma current is unaffected when the profile object
+        renormalises to `Ip`.
 
     Returns
     -------
@@ -641,10 +675,12 @@ def read_profiles_from_equilibrium_ids(ids, slice_index=0):
     b0 = b0[slice_index] if b0.size > 1 else b0[0]
     fvac = abs(b0 * float(ids.vacuum_toroidal_field.r0))
 
+    taper = edge_taper(psi_n, edge_taper_width)
+
     return {
         "psi_n": _strictly_increasing(psi_n),
-        "pprime": scale * pprime,
-        "ffprime": scale * ffprime,
+        "pprime": scale * pprime * taper,
+        "ffprime": scale * ffprime * taper,
         "Ip": Ip,
         "fvac": fvac,
         "psi_axis": sign * psi_axis / _PSI_IDS_OVER_PSI_FREEGSNKE,
@@ -666,6 +702,7 @@ def profiles_from_equilibrium_ids(
     Raxis=1.0,
     Ip_logic=True,
     interpolator="univariate_spline",
+    edge_taper_width=0.0,
 ):
     """
     Builds a `GeneralPprimeFFprime` profile object from the p' and FF' profiles
@@ -691,6 +728,8 @@ def profiles_from_equilibrium_ids(
         If True, the current density is renormalised to match `Ip` exactly.
     interpolator : str
         Interpolator passed to `GeneralPprimeFFprime`.
+    edge_taper_width : float
+        See `read_profiles_from_equilibrium_ids`.
 
     Returns
     -------
@@ -701,7 +740,9 @@ def profiles_from_equilibrium_ids(
     # imported here to avoid a circular import at module load time
     from .jtor_update import GeneralPprimeFFprime
 
-    data = read_profiles_from_equilibrium_ids(ids, slice_index=slice_index)
+    data = read_profiles_from_equilibrium_ids(
+        ids, slice_index=slice_index, edge_taper_width=edge_taper_width
+    )
     return GeneralPprimeFFprime(
         eq=eq,
         Ip=data["Ip"] if Ip is None else Ip,
@@ -715,7 +756,9 @@ def profiles_from_equilibrium_ids(
     )
 
 
-def update_profiles_from_equilibrium_ids(profiles, ids, slice_index=0, Ip=None):
+def update_profiles_from_equilibrium_ids(
+    profiles, ids, slice_index=0, Ip=None, edge_taper_width=0.0
+):
     """
     Updates an existing `GeneralPprimeFFprime` profile object in place with the
     p' and FF' profiles stored in an IMAS `equilibrium` IDS (see
@@ -733,6 +776,8 @@ def update_profiles_from_equilibrium_ids(profiles, ids, slice_index=0, Ip=None):
         Index of the time slice to read.
     Ip : float, optional
         Plasma current [A]. Defaults to the magnitude of the IDS value.
+    edge_taper_width : float
+        See `read_profiles_from_equilibrium_ids`.
 
     Returns
     -------
@@ -740,7 +785,9 @@ def update_profiles_from_equilibrium_ids(profiles, ids, slice_index=0, Ip=None):
         The (same) updated profile object.
     """
 
-    data = read_profiles_from_equilibrium_ids(ids, slice_index=slice_index)
+    data = read_profiles_from_equilibrium_ids(
+        ids, slice_index=slice_index, edge_taper_width=edge_taper_width
+    )
     profiles.psi_n = data["psi_n"]
     profiles.pprime_data = data["pprime"]
     profiles.ffprime_data = data["ffprime"]

@@ -170,3 +170,26 @@ def test_save_and_load_ids(equilibrium_ids, tmp_path):
         np.asarray(loaded.time_slice[0].profiles_1d.dpressure_dpsi),
         np.asarray(equilibrium_ids.time_slice[0].profiles_1d.dpressure_dpsi),
     )
+
+
+def test_edge_taper(solved_equilibrium, equilibrium_ids):
+    """The edge taper brings p' and FF' smoothly to zero at the separatrix and
+    leaves the profiles untouched away from it."""
+    psi_n = np.linspace(0.0, 1.0, 101)
+    taper = imas_read_write.edge_taper(psi_n, 0.02)
+    assert taper[-1] == 0.0
+    assert np.all(taper[psi_n <= 0.98] == 1.0)
+    assert np.all(np.diff(taper[psi_n >= 0.98]) <= 0.0)
+    np.testing.assert_array_equal(imas_read_write.edge_taper(psi_n, 0.0), 1.0)
+
+    plain = imas_read_write.read_profiles_from_equilibrium_ids(equilibrium_ids)
+    tapered = imas_read_write.read_profiles_from_equilibrium_ids(
+        equilibrium_ids, edge_taper_width=0.05
+    )
+    inside = plain["psi_n"] < 0.95
+    np.testing.assert_array_equal(tapered["pprime"][inside], plain["pprime"][inside])
+    np.testing.assert_array_equal(tapered["ffprime"][inside], plain["ffprime"][inside])
+    assert (
+        abs(tapered["pprime"][-1]) < abs(plain["pprime"][-1])
+        or plain["pprime"][-1] == 0.0
+    )
