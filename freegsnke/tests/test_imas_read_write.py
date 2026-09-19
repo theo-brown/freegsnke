@@ -193,3 +193,27 @@ def test_edge_taper(solved_equilibrium, equilibrium_ids):
         abs(tapered["pprime"][-1]) < abs(plain["pprime"][-1])
         or plain["pprime"][-1] == 0.0
     )
+
+
+def test_written_q_matches_toroidal_flux(solved_test_equilibrium):
+    """The toroidal flux phi = int 2 pi q dpsi built from the written q must
+    agree with the toroidal flux enclosed by the surfaces of the writer's own
+    psi_n normalisation (independently computed here by summing F/R over grid
+    cells). `eq.q` would instead normalise the flux to the X-point, which is
+    not the plasma boundary for a limiter-bound plasma."""
+    eq, profiles = solved_test_equilibrium
+    ids = imas_read_write.write_equilibrium_to_ids(eq, profiles)
+    profiles_1d = ids.time_slice[0].profiles_1d
+    psi_n_ids = np.asarray(profiles_1d.psi_norm)
+    phi_ids = np.asarray(profiles_1d.phi)
+    psi_n_2d = (eq.psi() - eq.psi_axis) / (eq.psi_bndry - eq.psi_axis)
+    inside = eq.limiter_handler.mask_inside_limiter
+    fpol_2d = profiles.fpol(np.clip(psi_n_2d, 0.0, 1.0))
+    dA = (eq.R[1, 0] - eq.R[0, 0]) * (eq.Z[0, 1] - eq.Z[0, 0])
+    # (5% allows for the cell counting on the coarse test grid; the X-point
+    # normalisation of `eq.q` gives errors of 10-20% for limited plasmas)
+    for target in (0.5, 0.7, 0.9):
+        phi_direct = np.sum((fpol_2d / eq.R)[inside & (psi_n_2d < target)]) * dA
+        np.testing.assert_allclose(
+            np.interp(target, psi_n_ids, phi_ids), phi_direct, rtol=0.05
+        )

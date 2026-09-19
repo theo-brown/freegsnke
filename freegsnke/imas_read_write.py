@@ -143,6 +143,8 @@ def _flux_surface_geometry(eq, psi_n, fpol_1d, fields_2d=None):
             (Rmin, Rmax, Zmin, Zmax) extent - the same formulas as
             freegs4e's `geometricElongation`/`triangularity_upper/lower`,
             generalised from the LCFS to an arbitrary internal surface.
+        `q` : safety factor, q = (F / 2 pi) * ∮ dl / (R^2 Bp) (with the flux
+            in Wb/rad, i.e. dPhi/dpsi_total).
         `avg_inv_R`, `avg_inv_R2` : flux-surface averages <1/R>, <1/R^2>.
         `avg_R_Bp`, `avg_R2_Bp2`, `avg_Bp2` : flux-surface averages
             <R*Bp>, <R^2*Bp^2>, <Bp^2>, from which gm2/gm3/gm7 are built
@@ -175,6 +177,7 @@ def _flux_surface_geometry(eq, psi_n, fpol_1d, fields_2d=None):
             "r_inboard",
             "r_outboard",
             "volume",
+            "q",
             "elongation",
             "triangularity_upper",
             "triangularity_lower",
@@ -212,6 +215,8 @@ def _flux_surface_geometry(eq, psi_n, fpol_1d, fields_2d=None):
         def flux_average(values, Bp_inv=Bp_inv, l_cum=l_cum, norm=norm):
             return trapezoid(values * Bp_inv, l_cum) / norm
 
+        # q = dPhi/dpsi_total = (F / 2 pi) ∮ dl / (R^2 Bp) (psi here in Wb/rad)
+        result["q"][i] = fpol_1d[i] * trapezoid(Bp_inv / Rc**2, l_cum) / (2 * np.pi)
         result["avg_inv_R"][i] = flux_average(1 / Rc)
         result["avg_inv_R2"][i] = flux_average(1 / Rc**2)
         result["avg_R_Bp"][i] = flux_average(Rc * np.sqrt(Bp2))
@@ -368,23 +373,27 @@ def write_equilibrium_to_ids(
         profiles, psi_n_surfaces, eq.psi_axis, eq.psi_bndry
     )
 
-    # safety factor on the flux surfaces, extrapolated to the axis with a
-    # low-order polynomial in psi_n (q is smooth in psi near the axis)
-    q_surfaces = np.asarray(eq.q(psi_n_surfaces)).reshape(-1)
-    n_fit = min(_N_SURFACES_FOR_AXIS_EXTRAPOLATION, len(psi_n_surfaces))
-    q_axis_fit = np.polyfit(
-        psi_n_surfaces[:n_fit], q_surfaces[:n_fit], deg=min(2, n_fit - 1)
-    )
-    q_axis = np.polyval(q_axis_fit, 0.0)
-
-    # Remaining profiles (including the flux-averaged toroidal current density)
-    # all derive from one pass of flux-surface tracing
+    # All flux-surface quantities (including the safety factor and the
+    # flux-averaged toroidal current density) derive from one pass of
+    # flux-surface tracing, with the same normalisation of the flux as used
+    # for psi_n here. (Note that `eq.q` normalises the flux to the X-point
+    # whenever one exists in the domain, which is not the plasma boundary for a
+    # limiter-bound plasma.)
     jtor_interp = RectBivariateSpline(eq.R_1D, eq.Z_1D, profiles.jtor)
     geom = _flux_surface_geometry(
         eq, psi_n_surfaces, fpol_surfaces, fields_2d={"jtor": jtor_interp}
     )
     mag_r, mag_z = eq.magneticAxis()[0:2]
     jtor_axis = float(jtor_interp(mag_r, mag_z, grid=False))
+
+    # safety factor on the flux surfaces, extrapolated to the axis with a
+    # low-order polynomial in psi_n (q is smooth in psi near the axis)
+    q_surfaces = geom["q"]
+    n_fit = min(_N_SURFACES_FOR_AXIS_EXTRAPOLATION, len(psi_n_surfaces))
+    q_axis_fit = np.polyfit(
+        psi_n_surfaces[:n_fit], q_surfaces[:n_fit], deg=min(2, n_fit - 1)
+    )
+    q_axis = np.polyval(q_axis_fit, 0.0)
 
     # Flux surfaces very close to the axis cannot be traced reliably on the
     # computational grid, which would leave a gap in the profiles between the

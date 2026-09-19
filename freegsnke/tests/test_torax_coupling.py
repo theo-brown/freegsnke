@@ -5,7 +5,7 @@ import pytest
 
 torax = pytest.importorskip("torax")
 
-from freegsnke import imas_read_write, torax_coupling  # noqa: E402
+from freegsnke import GSstaticsolver, imas_read_write, torax_coupling  # noqa: E402
 
 
 def _PARABOLIC_PROFILE(axis_value, edge_value, n_points=21):
@@ -120,6 +120,88 @@ def test_profile_residual_and_relaxation(solved_test_equilibrium):
     np.testing.assert_allclose(
         np.asarray(relaxed.time_slice[0].profiles_1d.dpressure_dpsi),
         1.05 * np.asarray(ids_a.time_slice[0].profiles_1d.dpressure_dpsi),
+    )
+
+
+def test_anderson_acceleration_converges_faster_than_relaxation(
+    solved_test_equilibrium,
+):
+    """Anderson mixing finds the fixed point of a linear profile map in a few
+    iterations where plain relaxation converges only linearly."""
+    eq, profiles = solved_test_equilibrium
+    target = imas_read_write.write_equilibrium_to_ids(eq, profiles)
+    pprime_star = np.asarray(target.time_slice[0].profiles_1d.dpressure_dpsi)
+    ffprime_star = np.asarray(target.time_slice[0].profiles_1d.f_df_dpsi)
+
+    def fixed_point_map(ids):
+        # G(x) = x* + A (x - x*): slope +0.6 on p', -0.4 on FF'
+        profiles_1d = ids.time_slice[0].profiles_1d
+        out = imas_read_write.write_equilibrium_to_ids(eq, profiles)
+        out.time_slice[0].profiles_1d.dpressure_dpsi = pprime_star + 0.6 * (
+            np.asarray(profiles_1d.dpressure_dpsi) - pprime_star
+        )
+        out.time_slice[0].profiles_1d.f_df_dpsi = ffprime_star - 0.4 * (
+            np.asarray(profiles_1d.f_df_dpsi) - ffprime_star
+        )
+        return out
+
+    def iterate(mixer, n_iterations):
+        guess = imas_read_write.write_equilibrium_to_ids(eq, profiles)
+        guess.time_slice[0].profiles_1d.dpressure_dpsi = 1.3 * pprime_star
+        guess.time_slice[0].profiles_1d.f_df_dpsi = 0.7 * ffprime_star
+        residuals = []
+        for _ in range(n_iterations):
+            new = fixed_point_map(guess)
+            residuals.append(torax_coupling.profile_residual(new, guess))
+            guess = mixer.update(new, guess)
+        return residuals
+
+    relaxed = iterate(torax_coupling.AndersonAccelerator(memory=0, relaxation=0.5), 6)
+    accelerated = iterate(
+        torax_coupling.AndersonAccelerator(memory=4, relaxation=0.5), 6
+    )
+    # plain relaxation: contraction of 0.8 per iteration for the p' block
+    assert relaxed[-1] > 1e-4 * relaxed[0]
+    # the linear map has two distinct slopes: Anderson is exact after 3 updates
+    assert accelerated[3] < 1e-8 * accelerated[0]
+    assert accelerated[-1] < 1e-8 * accelerated[0]
+
+
+def test_linear_shape_controller_restores_targets(solved_test_equilibrium):
+    """After a coil current perturbation moves the plasma, the controller
+    brings the boundary targets back within tolerance in a few forward solves."""
+    eq, profiles = solved_test_equilibrium
+    eq = eq.create_auxiliary_equilibrium()
+    profiles = profiles.copy()
+    solver = GSstaticsolver.NKGSsolver(eq)
+    # a subset of the poloidal field coils (the static solve of this small
+    # test equilibrium is slow to converge for perturbations of some coils)
+    coils = ["D1", "D2", "D3", "D5", "D6", "D7", "P4"]
+    controller = torax_coupling.LinearShapeController(coils, tolerance=1e-3)
+    controller.linearise(eq, profiles, solver, 1e-7)
+    reference = controller.target_values.copy()
+    assert np.all(np.isfinite(reference))
+    assert controller.response_matrix.shape == (5, len(coils))
+
+    # perturb the currents so as to move the outboard boundary by ~1 cm
+    # (using the response matrix), and re-solve
+    shift = np.array([0.0, 0.01, 0.0, 0.0, 0.0])
+    dI = np.linalg.lstsq(controller.response_matrix, shift, rcond=None)[0]
+    currents = eq.tokamak.getCurrents()
+    for label, delta in zip(coils, dI):
+        eq.tokamak.set_coil_current(
+            coil_label=label, current_value=currents[label] + delta
+        )
+    solver.solve(
+        eq=eq, profiles=profiles, constrain=None, target_relative_tolerance=1e-7
+    )
+    perturbed = torax_coupling.boundary_targets(eq)
+    assert np.max(np.abs(perturbed - reference)) > 3e-3
+
+    error = controller.control(eq, profiles, solver, 1e-7)
+    assert error < 1e-3
+    np.testing.assert_allclose(
+        torax_coupling.boundary_targets(eq), reference, atol=1e-3
     )
 
 

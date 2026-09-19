@@ -17,6 +17,7 @@ cp "../examples/example09 - virtual_circuits_MASTU.ipynb" notebooks
 cp "../examples/example10 - growth_rates.ipynb" notebooks
 cp "../examples/example12a - loose_coupling_with_TORAX.ipynb" notebooks
 cp "../examples/example12b - loose_coupling_with_TORAX_vessel_dynamics.ipynb" notebooks
+cp "../examples/example12c - loose_coupling_with_TORAX_ITER.ipynb" notebooks
 cp -r ../examples/data notebooks
 
 echo "Copying images"

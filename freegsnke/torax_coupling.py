@@ -42,6 +42,7 @@ You should have received a copy of the GNU Lesser General Public License
 along with FreeGSNKE.  If not, see <http://www.gnu.org/licenses/>.
 """
 
+import copy
 import dataclasses
 import time as _time
 
@@ -105,6 +106,10 @@ def _make_torax_substepper(step_fn, verbose_log):
     adaptive = bool(step_fn.runtime_params_provider.numerics.adaptive_dt)
 
     def substep(state, post_processed, dt, geo_provider):
+        """
+        Advances by `dt`. Returns the lists of states and post-processed
+        outputs after each TORAX step and the TORAX error status.
+        """
         states, post_processed_outputs = [], []
         remaining = float(dt)
         sim_error = torax.SimError.NO_ERROR
@@ -156,6 +161,211 @@ def default_psi_n_grid(n_points=129, psi_n_min=0.01, psi_n_max=0.99):
     return np.linspace(np.sqrt(psi_n_min), np.sqrt(psi_n_max), n_points) ** 2
 
 
+def boundary_targets(eq, reference_xpoint=None):
+    """
+    Default shape targets for `LinearShapeController`: the inboard and
+    outboard midplane radii of the plasma boundary (at the height of the
+    magnetic axis), the height of the magnetic axis and the (R, Z) position
+    of an X-point: the one closest to `reference_xpoint` if given, otherwise
+    the one closest in flux to the plasma boundary (the active X-point of a
+    diverted plasma; for a limited plasma with a nearby field null, the null
+    that would become the active X-point). Tracking a reference position
+    keeps the target well defined for double-null plasmas, where the X-point
+    closest in flux can switch between the two nulls.
+
+    Returns
+    -------
+    np.array
+        [R_in, R_out, Z_axis, R_x, Z_x] (the last two are NaN without any
+        X-point in the domain).
+    """
+    from freegs4e.critical import find_critical
+
+    R_axis, Z_axis = eq.magneticAxis()[0:2]
+    R_in, R_out = eq.innerOuterSeparatrix(Z=Z_axis)
+    targets = [R_in, R_out, Z_axis, np.nan, np.nan]
+    opoints, xpoints = find_critical(eq.R, eq.Z, eq.psi())
+    if len(xpoints) > 0:
+        if reference_xpoint is None:
+            xpoint = min(list(xpoints), key=lambda x: abs(x[2] - eq.psi_bndry))
+        else:
+            xpoint = min(
+                list(xpoints),
+                key=lambda x: np.hypot(
+                    x[0] - reference_xpoint[0], x[1] - reference_xpoint[1]
+                ),
+            )
+        targets[3:] = [xpoint[0], xpoint[1]]
+    return np.asarray(targets, dtype=float)
+
+
+class LinearShapeController:
+    """
+    Ideal linear shape controller for the loose coupling.
+
+    Holds a set of shape targets T(eq) (by default `boundary_targets`: the
+    midplane boundary radii, the axis height and the X-point position) at
+    their reference values by adjusting the currents of a set of active coils.
+    The response matrix S = dT/dI is obtained by finite differences (one static
+    forward solve per coil) and reused for a number of coupling intervals; at
+    each equilibrium solve, Gauss-Newton iterations dI = S^+ (T_ref - T(eq))
+    (least-squares, minimum-norm current changes) followed by a forward solve
+    are applied until the targets are met to `tolerance`.
+
+    This mimics a perfect shape/position control system on the transport
+    timescale (the same role the inverse solve plays when building an
+    equilibrium), at a small cost: a few forward solves per equilibrium.
+    """
+
+    def __init__(
+        self,
+        coils,
+        target_calculator=None,
+        target_values=None,
+        tolerance=2e-3,
+        max_iterations=4,
+        relative_step=0.005,
+        min_step=1e3,
+        relinearise_every=1,
+    ):
+        """
+        Parameters
+        ----------
+        coils : list of str
+            Labels of the active coils used for control.
+        target_calculator : callable, optional
+            `target_calculator(eq) -> np.array` of shape targets. By default
+            `boundary_targets`, tracking the X-point closest to its position
+            at the first linearisation.
+        target_values : np.array, optional
+            Reference target values; by default those of the equilibrium at the
+            first `linearise` call.
+        tolerance : float
+            Largest acceptable absolute target error (all targets are lengths,
+            in m).
+        max_iterations : int
+            Maximum Gauss-Newton iterations per equilibrium solve.
+        relative_step : float
+            Relative coil current perturbation used for the finite-difference
+            response matrix.
+        min_step : float
+            Smallest absolute current perturbation [A].
+        relinearise_every : int
+            The response matrix is rebuilt every this many committed coupling
+            intervals (0 keeps the first one throughout).
+        """
+        self.coils = list(coils)
+        self._reference_xpoint = None
+        self.target_calculator = (
+            self._default_targets if target_calculator is None else target_calculator
+        )
+        self.target_values = (
+            None if target_values is None else np.asarray(target_values, float)
+        )
+        self.tolerance = tolerance
+        self.max_iterations = max_iterations
+        self.relative_step = relative_step
+        self.min_step = min_step
+        self.relinearise_every = relinearise_every
+        self.response_matrix = None
+        self.intervals_since_linearisation = 0
+        self.history = []
+
+    def _default_targets(self, eq):
+        targets = boundary_targets(eq, reference_xpoint=self._reference_xpoint)
+        if self._reference_xpoint is None and np.all(np.isfinite(targets[3:])):
+            self._reference_xpoint = tuple(targets[3:])
+        return targets
+
+    def _currents(self, eq):
+        currents = eq.tokamak.getCurrents()
+        return np.array([currents[label] for label in self.coils], float)
+
+    def _set_currents(self, eq, values):
+        for label, value in zip(self.coils, values):
+            eq.tokamak.set_coil_current(coil_label=label, current_value=float(value))
+
+    def linearise(self, eq, profiles, solver, target_relative_tolerance):
+        """Builds the response matrix dT/dI by finite differences about `eq`."""
+        currents_0 = self._currents(eq)
+        psi_0 = eq.plasma_psi.copy()
+        targets_0 = self.target_calculator(eq)
+        if self.target_values is None:
+            self.target_values = targets_0.copy()
+        matrix = np.zeros((len(targets_0), len(self.coils)))
+        for j in range(len(self.coils)):
+            step = max(self.relative_step * abs(currents_0[j]), self.min_step)
+            currents = currents_0.copy()
+            currents[j] += step
+            self._set_currents(eq, currents)
+            eq.plasma_psi = psi_0.copy()
+            solver.solve(
+                eq=eq,
+                profiles=profiles,
+                constrain=None,
+                target_relative_tolerance=target_relative_tolerance,
+                verbose=False,
+            )
+            matrix[:, j] = (self.target_calculator(eq) - targets_0) / step
+        self._set_currents(eq, currents_0)
+        eq.plasma_psi = psi_0
+        solver.solve(
+            eq=eq,
+            profiles=profiles,
+            constrain=None,
+            target_relative_tolerance=target_relative_tolerance,
+            verbose=False,
+        )
+        self.response_matrix = matrix
+        self.intervals_since_linearisation = 0
+
+    def control(self, eq, profiles, solver, target_relative_tolerance):
+        """
+        Adjusts the coil currents of the (solved) equilibrium `eq` so that
+        the targets meet their reference values. Returns the final target
+        error (max abs).
+        """
+        if self.response_matrix is None:
+            self.linearise(eq, profiles, solver, target_relative_tolerance)
+        error = np.nan
+        for _ in range(self.max_iterations):
+            targets = self.target_calculator(eq)
+            if len(targets) != len(self.target_values):
+                raise RuntimeError(
+                    "The number of shape targets changed (e.g. the plasma went "
+                    "from diverted to limited); cannot control the shape."
+                )
+            mismatch = self.target_values - targets
+            if not np.all(np.isfinite(mismatch)):
+                raise RuntimeError("A shape target is undefined (e.g. no X-point).")
+            error = float(np.max(np.abs(mismatch)))
+            if error < self.tolerance:
+                break
+            dI = np.linalg.lstsq(self.response_matrix, mismatch, rcond=None)[0]
+            self._set_currents(eq, self._currents(eq) + dI)
+            solver.solve(
+                eq=eq,
+                profiles=profiles,
+                constrain=None,
+                target_relative_tolerance=target_relative_tolerance,
+                verbose=False,
+            )
+        else:
+            targets = self.target_calculator(eq)
+            error = float(np.max(np.abs(self.target_values - targets)))
+        self.history.append(error)
+        return error
+
+    def committed(self, eq, profiles, solver, target_relative_tolerance):
+        """Called once per accepted coupling interval (re-linearisation)."""
+        self.intervals_since_linearisation += 1
+        if (
+            self.relinearise_every
+            and self.intervals_since_linearisation >= self.relinearise_every
+        ):
+            self.linearise(eq, profiles, solver, target_relative_tolerance)
+
+
 class StaticEquilibriumSolver:
     """
     Free-boundary equilibrium provider for the loose coupling, based on
@@ -167,10 +377,13 @@ class StaticEquilibriumSolver:
     time, the static forward problem is solved (warm-started from the previous
     solution held in `eq`) and the result is written to a new `equilibrium` IDS.
 
+    With a `shape_controller` given, the coil currents are adjusted at each
+    solve so that the plasma shape keeps its targets (an ideal shape
+    controller, see `LinearShapeController`); otherwise they are prescribed.
+
     Any object with the same `solve(time, equilibrium_ids)` and
     `initial_equilibrium_ids(time)` interface can be used in place of this
-    class with `run_loose_coupling`, e.g. to include a shape controller or an
-    inverse solve for the coil currents. An optional `commit(time,
+    class with `run_loose_coupling`, e.g. to include a different controller. An optional `commit(time,
     equilibrium_ids)` method is called by `run_loose_coupling` once a coupling
     interval has been accepted (see `EvolutiveEquilibriumSolver`).
     """
@@ -189,6 +402,7 @@ class StaticEquilibriumSolver:
         Ip_logic=True,
         interpolator="univariate_spline",
         edge_taper_width=DEFAULT_EDGE_TAPER_WIDTH,
+        shape_controller=None,
     ):
         """
         Parameters
@@ -227,10 +441,26 @@ class StaticEquilibriumSolver:
             Width in normalised flux over which the received p' and FF' are
             brought to zero at the separatrix (0 disables it). See
             `imas_read_write.read_profiles_from_equilibrium_ids`.
+        shape_controller : LinearShapeController, optional
+            If given, the currents of its control coils are adjusted at each
+            solve so that the plasma shape targets (by default the midplane
+            boundary radii, axis height and X-point position) keep their
+            initial values while the profiles evolve, i.e. an ideal shape
+            controller. Without it the coil currents are prescribed (see
+            `coil_currents`) and the plasma shape and position are free to
+            change with the profiles, which over a long evolution with large
+            profile changes can move the plasma against the limiter. Cannot be
+            combined with `coil_currents`.
         """
+        if shape_controller is not None and coil_currents is not None:
+            raise ValueError(
+                "shape_controller and coil_currents (prescribed currents) "
+                "cannot both be given."
+            )
         self.eq = eq
         self.profiles = profiles
         self.coil_currents = coil_currents
+        self.shape_controller = shape_controller
         self.solver = solver if solver is not None else GSstaticsolver.NKGSsolver(eq)
         self.psi_n = default_psi_n_grid() if psi_n is None else np.asarray(psi_n)
         self.fvac = profiles.fvac() if fvac is None else fvac
@@ -313,6 +543,10 @@ class StaticEquilibriumSolver:
             verbose=False,
             **self.solver_kwargs,
         )
+        if self.shape_controller is not None:
+            self.shape_controller.control(
+                self.eq, self.profiles, self.solver, self.target_relative_tolerance
+            )
         self.n_solves += 1
         self.relative_changes.append(getattr(self.solver, "relative_change", np.nan))
         if not np.all(np.isfinite(self.eq.plasma_psi)):
@@ -324,7 +558,11 @@ class StaticEquilibriumSolver:
         )
 
     def commit(self, time, equilibrium_ids):
-        """Accepts the last solve (no state to keep for the static solver)."""
+        """Accepts the last solve (re-linearises the shape controller)."""
+        if self.shape_controller is not None:
+            self.shape_controller.committed(
+                self.eq, self.profiles, self.solver, self.target_relative_tolerance
+            )
 
 
 def _interpolated_profile_update(
@@ -614,22 +852,55 @@ def _exchanged_profiles(equilibrium_ids):
     )
 
 
+def _midplane_radii(equilibrium_ids, psi_n):
+    """
+    Inboard and outboard midplane radii of the flux surfaces of the first time
+    slice of an IDS (`r_inboard`, `r_outboard`). If they are missing or
+    invalid, the reference major radius R0 is returned for both.
+    """
+    profiles_1d = equilibrium_ids.time_slice[0].profiles_1d
+    R0 = float(equilibrium_ids.vacuum_toroidal_field.r0)
+    r_in = np.asarray(profiles_1d.r_inboard, dtype=float)
+    r_out = np.asarray(profiles_1d.r_outboard, dtype=float)
+    valid = (
+        len(r_in) == len(psi_n)
+        and len(r_out) == len(psi_n)
+        and np.all(r_in > 0)
+        and np.all(r_out > 0)
+    )
+    if not valid:
+        r_in = r_out = np.full_like(psi_n, R0)
+    return r_in, r_out
+
+
+def _toroidal_current_density(pprime, ffprime, radii):
+    """Jtor = R p' + FF' / (mu0 R) stacked for each array of radii."""
+    return np.concatenate([R * pprime + ffprime / (mu0 * R) for R in radii])
+
+
 def profile_residual(equilibrium_ids, previous_equilibrium_ids):
     """
     Relative change of the exchanged p' and FF' profiles between two
     `equilibrium` IDSs, used as the loose-coupling convergence measure.
 
-    The two profiles enter the Grad-Shafranov equation through the toroidal
-    current density Jtor = R p' + FF' / (mu0 R), so they are compared on a
-    common current-density scale using the reference major radius R0 of the
-    IDS (`vacuum_toroidal_field.r0`):
+    The two profiles enter the Grad-Shafranov equation only through the
+    toroidal current density Jtor = R p' + FF' / (mu0 R), so they are compared
+    through Jtor evaluated at the inboard and outboard midplane radii of each
+    flux surface (`r_inboard`, `r_outboard` of the newest IDS):
 
-        a = R0 p',  b = FF' / (mu0 R0),
-        residual = sqrt(||da||^2 + ||db||^2) / sqrt(||a||^2 + ||b||^2),
+        residual = ||Jtor_new - Jtor_old|| / ||Jtor_new||,
 
-    with the old profiles interpolated onto the new normalised-flux grid. This
-    avoids spurious large residuals when one of the two profiles (typically FF'
-    for a plasma close to the force-free/diamagnetic balance) is small.
+    with the old profiles interpolated onto the new normalised-flux grid and
+    the norm taken over both radii and all flux surfaces. Comparing Jtor
+    rather than p' and FF' separately avoids two spurious contributions: a
+    large relative change of a profile that is small (typically FF' for a
+    plasma close to the force-free/diamagnetic balance), and the exchange of
+    current between the p' and FF' terms on the innermost flux surfaces, where
+    Jtor is well defined but its split into the two terms is not (TORAX
+    computes the on-axis p' from a second difference of the poloidal flux and
+    sets FF' to conserve <Jtor/R>, so the split there responds strongly to
+    small changes of the equilibrium while Jtor does not). If the IDS carries
+    no midplane radii, both are replaced by the reference major radius R0.
 
     Parameters
     ----------
@@ -643,18 +914,19 @@ def profile_residual(equilibrium_ids, previous_equilibrium_ids):
     float
         The residual.
     """
-    psi_n, pprime, ffprime, R0 = _exchanged_profiles(equilibrium_ids)
+    psi_n, pprime, ffprime, _ = _exchanged_profiles(equilibrium_ids)
     psi_n_old, pprime_old, ffprime_old, _ = _exchanged_profiles(
         previous_equilibrium_ids
     )
-    a = R0 * pprime
-    b = ffprime / (mu0 * R0)
-    da = a - R0 * np.interp(psi_n, psi_n_old, pprime_old)
-    db = b - np.interp(psi_n, psi_n_old, ffprime_old) / (mu0 * R0)
-    norm = np.sqrt(np.sum(a**2) + np.sum(b**2))
-    return float(
-        np.sqrt(np.sum(da**2) + np.sum(db**2)) / max(norm, _RESIDUAL_NORM_FLOOR)
+    radii = _midplane_radii(equilibrium_ids, psi_n)
+    jtor = _toroidal_current_density(pprime, ffprime, radii)
+    jtor_old = _toroidal_current_density(
+        np.interp(psi_n, psi_n_old, pprime_old),
+        np.interp(psi_n, psi_n_old, ffprime_old),
+        radii,
     )
+    norm = np.linalg.norm(jtor)
+    return float(np.linalg.norm(jtor - jtor_old) / max(norm, _RESIDUAL_NORM_FLOOR))
 
 
 def relax_profiles(equilibrium_ids, previous_equilibrium_ids, relaxation):
@@ -693,6 +965,130 @@ def relax_profiles(equilibrium_ids, previous_equilibrium_ids, relaxation):
         psi_n, psi_n_old, ffprime_old
     )
     return equilibrium_ids
+
+
+class AndersonAccelerator:
+    """
+    Anderson acceleration of the loose-coupling fixed-point iteration on the
+    exchanged p' and FF' profiles.
+
+    The iteration maps the profiles handed to the equilibrium solver, x, to the
+    profiles TORAX returns after the coupling interval, G(x). Plain relaxation
+    updates x <- x + relaxation * (G(x) - x), which converges linearly with a
+    rate set by the (case dependent) slope of G. Anderson mixing uses the last
+    `memory` differences of x and of the residual f = G(x) - x to extrapolate
+    towards the fixed point (a multi-secant quasi-Newton update),
+
+        x_next = x + beta f - (dX + beta dF) gamma,   gamma = argmin ||f - dF gamma||,
+
+    with beta the relaxation factor and dX, dF the matrices of successive
+    differences. With `memory` = 0 the update reduces to plain relaxation. The
+    mixed vector holds the two profiles on a common current-density scale
+    (a = R0 p', b = FF' / (mu0 R0)) on the normalised-flux grid of the newest
+    IDS, and a fresh history is started for each coupling interval with
+    `reset`.
+    """
+
+    def __init__(self, memory=4, relaxation=0.5, rcond=1e-8):
+        """
+        Parameters
+        ----------
+        memory : int
+            Number of previous iterates kept (0 gives plain relaxation).
+        relaxation : float
+            Damping (mixing) factor beta in (0, 1].
+        rcond : float
+            Cut-off ratio for the singular values in the least-squares
+            problem for the mixing coefficients.
+        """
+        if memory < 0:
+            raise ValueError("memory must be non-negative.")
+        if not 0.0 < relaxation <= 1.0:
+            raise ValueError("relaxation must lie in (0, 1].")
+        self.memory = memory
+        self.relaxation = relaxation
+        self.rcond = rcond
+        self.reset()
+
+    def reset(self):
+        """Forgets the iteration history (call at the start of an interval)."""
+        self.psi_n = None
+        self.R0 = None
+        self.x_history = []
+        self.f_history = []
+
+    def _vector(self, equilibrium_ids, psi_n):
+        """The (a, b) vector of an IDS interpolated onto the grid `psi_n`."""
+        psi_n_ids, pprime, ffprime, _ = _exchanged_profiles(equilibrium_ids)
+        return np.concatenate(
+            [
+                self.R0 * np.interp(psi_n, psi_n_ids, pprime),
+                np.interp(psi_n, psi_n_ids, ffprime) / (mu0 * self.R0),
+            ]
+        )
+
+    def _regrid(self, vector, psi_n_new):
+        """Re-interpolates a stored vector from the current grid onto a new one."""
+        n = len(self.psi_n)
+        return np.concatenate(
+            [
+                np.interp(psi_n_new, self.psi_n, vector[:n]),
+                np.interp(psi_n_new, self.psi_n, vector[n:]),
+            ]
+        )
+
+    def update(self, equilibrium_ids, previous_equilibrium_ids):
+        """
+        Computes the next profiles to hand to the equilibrium solver.
+
+        The vectors are held on the normalised-flux grid of the newest IDS
+        (the history is re-interpolated whenever the grid changes, which it
+        does slightly from one TORAX output to the next). Since successive
+        grids converge together with the iteration, the fixed point is free of
+        interpolation error, consistently with `profile_residual`: with a
+        fixed reference grid instead, the interpolation of TORAX's grid-scale
+        edge structure back and forth leaves a residual floor.
+
+        Parameters
+        ----------
+        equilibrium_ids : imas.ids_toplevel.IDSToplevel
+            Newest IDS from TORAX, G(x) (not modified).
+        previous_equilibrium_ids : imas.ids_toplevel.IDSToplevel
+            IDS passed to the equilibrium solver in this iteration, x.
+
+        Returns
+        -------
+        imas.ids_toplevel.IDSToplevel
+            A copy of `equilibrium_ids` with the mixed p' and FF' profiles.
+        """
+        if self.memory == 0 and self.relaxation == 1.0:
+            return equilibrium_ids
+        psi_n_new, _, _, R0 = _exchanged_profiles(equilibrium_ids)
+        if self.psi_n is None:
+            self.R0 = R0
+        elif len(psi_n_new) != len(self.psi_n) or np.any(psi_n_new != self.psi_n):
+            self.x_history = [self._regrid(v, psi_n_new) for v in self.x_history]
+            self.f_history = [self._regrid(v, psi_n_new) for v in self.f_history]
+        self.psi_n = psi_n_new.copy()
+
+        x = self._vector(previous_equilibrium_ids, self.psi_n)
+        f = self._vector(equilibrium_ids, self.psi_n) - x
+        beta = self.relaxation
+        x_next = x + beta * f
+        if self.memory > 0 and self.x_history:
+            dX = np.array([x - x_old for x_old in self.x_history]).T
+            dF = np.array([f - f_old for f_old in self.f_history]).T
+            gamma = np.linalg.lstsq(dF, f, rcond=self.rcond)[0]
+            x_next = x_next - (dX + beta * dF) @ gamma
+        self.x_history = (self.x_history + [x])[-self.memory :] if self.memory else []
+        self.f_history = (self.f_history + [f])[-self.memory :] if self.memory else []
+
+        mixed = copy.deepcopy(equilibrium_ids)
+        profiles_1d = mixed.time_slice[0].profiles_1d
+        n = len(self.psi_n)
+        profiles_1d.dpressure_dpsi = x_next[:n] / self.R0
+        profiles_1d.f_df_dpsi = x_next[n:] * mu0 * self.R0
+        return mixed
 
 
 @dataclasses.dataclass
@@ -769,6 +1165,7 @@ def run_loose_coupling(
     Ip_from_parameters=True,
     store_equilibria=False,
     verbose=True,
+    anderson_memory=0,
 ):
     """
     Runs a loosely coupled FreeGSNKE-TORAX simulation.
@@ -825,6 +1222,13 @@ def run_loose_coupling(
         coupling time in the result.
     verbose : bool
         Print progress information.
+    anderson_memory : int
+        If positive, the profiles handed to the equilibrium solver are updated
+        by Anderson acceleration with this memory (see `AndersonAccelerator`,
+        `relaxation` then acts as the damping factor) instead of plain
+        relaxation. Useful when the plain iteration converges slowly, e.g.
+        because the profiles TORAX returns respond strongly (with a positive
+        slope) to the equilibrium, as found for ITER-like cases.
 
     Returns
     -------
@@ -877,6 +1281,7 @@ def run_loose_coupling(
             print(message, flush=True)
 
     advance_torax = _make_torax_substepper(step_fn, log)
+    mixer = AndersonAccelerator(memory=anderson_memory, relaxation=relaxation)
 
     # ------------------------------------------------------------------ #
     # Initial condition: make the TORAX initial state consistent with the
@@ -910,7 +1315,7 @@ def run_loose_coupling(
             guess_ids = new_ids
             converged_initial = True
             break
-        guess_ids = relax_profiles(new_ids, guess_ids, relaxation)
+        guess_ids = mixer.update(new_ids, guess_ids)
 
     if hasattr(equilibrium_solver, "commit"):
         equilibrium_solver.commit(t_initial, guess_ids)
@@ -940,6 +1345,7 @@ def run_loose_coupling(
         guess_ids = torax_ids_history[-1]
         step_residuals = []
         step_converged = False
+        mixer.reset()
         for iteration in range(max_iterations):
             eq_ids = equilibrium_solver.solve(t_next, guess_ids)
             geo_next = geometry_from(eq_ids)
@@ -962,7 +1368,7 @@ def run_loose_coupling(
             if residual < tolerance:
                 step_converged = True
                 break
-            guess_ids = relax_profiles(new_ids, guess_ids, relaxation)
+            guess_ids = mixer.update(new_ids, guess_ids)
 
         if sim_error != torax.SimError.NO_ERROR:
             log(

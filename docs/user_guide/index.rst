@@ -26,3 +26,4 @@ The notebooks are displayed statically on the following pages, but running them 
     ../notebooks/example10 - growth_rates
     ../notebooks/example12a - loose_coupling_with_TORAX
     ../notebooks/example12b - loose_coupling_with_TORAX_vessel_dynamics
+    ../notebooks/example12c - loose_coupling_with_TORAX_ITER
