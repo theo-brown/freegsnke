@@ -178,3 +178,46 @@ def test_run_loose_coupling_rejects_bad_arguments(
         torax_coupling.run_loose_coupling(
             torax_config, equilibrium_solver, coupling_dt=0.01, max_iterations=0
         )
+
+
+def test_run_loose_coupling_evolutive(solved_test_equilibrium, torax_config):
+    """A short loosely coupled run with the vessel-timescale equilibrium
+    evolution completes, commits its state and keeps Ip consistent."""
+    eq, profiles = solved_test_equilibrium
+    eq = eq.create_auxiliary_equilibrium()
+    profiles = profiles.copy()
+    from freegsnke import GSstaticsolver
+
+    solver = GSstaticsolver.NKGSsolver(eq)
+    solver.forward_solve(eq, profiles, 1e-9)
+    config = torax.ToraxConfig.from_dict(
+        {**TORAX_CONFIG, "numerics": {**TORAX_CONFIG["numerics"], "t_final": 0.004}}
+    )
+    equilibrium_solver = torax_coupling.EvolutiveEquilibriumSolver(
+        eq, profiles, solver=solver, vessel_timestep=1e-3, verbose=False
+    )
+    result = torax_coupling.run_loose_coupling(
+        config,
+        equilibrium_solver,
+        coupling_dt=0.004,
+        max_iterations=2,
+        tolerance=1e-2,
+        initial_iterations=1,
+        verbose=False,
+    )
+    assert result.sim_error == torax.SimError.NO_ERROR
+    np.testing.assert_allclose(result.times, [0.0, 0.004])
+    # the evolution was committed at the end of the interval, in 4 sub-steps
+    assert equilibrium_solver.committed_state.time == pytest.approx(0.004)
+    times = [h["time"] for h in equilibrium_solver.substep_history]
+    np.testing.assert_allclose(times, np.linspace(0.0, 0.004, 5), atol=1e-12)
+    Ip_torax = float(result.torax_output["scalars"]["Ip"].values[-1])
+    np.testing.assert_allclose(
+        equilibrium_solver.substep_history[-1]["Ip"], Ip_torax, rtol=1e-6
+    )
+    np.testing.assert_allclose(eq.plasmaCurrent(), Ip_torax, rtol=1e-6)
+    # passive structures carry induced currents after the interval
+    passive = equilibrium_solver.evolution.currents[
+        equilibrium_solver.evolution.n_active_coils :
+    ]
+    assert np.all(np.isfinite(passive))

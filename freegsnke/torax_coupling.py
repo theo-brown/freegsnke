@@ -50,6 +50,7 @@ from freegs4e.gradshafranov import mu0
 
 from . import GSstaticsolver, imas_read_write
 from .jtor_update import GeneralPprimeFFprime
+from .metal_evolution import MetalCurrentsEvolution
 
 try:
     import jax.numpy as jnp
@@ -68,6 +69,10 @@ except ImportError as error:  # pragma: no cover - exercised only without torax
 _MIN_RELATIVE_DT = 1e-8
 # floor for the profile norms used to make the convergence residual relative
 _RESIDUAL_NORM_FLOOR = 1e-300
+# static solver settings used unless overridden through `solver_kwargs`
+_DEFAULT_STATIC_SOLVER_KWARGS = dict(
+    max_n_directions=32, target_relative_unexplained_residual=0.1
+)
 
 
 def _require_torax():
@@ -118,7 +123,9 @@ class StaticEquilibriumSolver:
     Any object with the same `solve(time, equilibrium_ids)` and
     `initial_equilibrium_ids(time)` interface can be used in place of this
     class with `run_loose_coupling`, e.g. to include a shape controller or an
-    inverse solve for the coil currents.
+    inverse solve for the coil currents. An optional `commit(time,
+    equilibrium_ids)` method is called by `run_loose_coupling` once a coupling
+    interval has been accepted (see `EvolutiveEquilibriumSolver`).
     """
 
     def __init__(
@@ -176,7 +183,12 @@ class StaticEquilibriumSolver:
         self.psi_n = default_psi_n_grid() if psi_n is None else np.asarray(psi_n)
         self.fvac = profiles.fvac() if fvac is None else fvac
         self.target_relative_tolerance = target_relative_tolerance
-        self.solver_kwargs = {} if solver_kwargs is None else dict(solver_kwargs)
+        # transport-code profiles do not vanish at the separatrix (the current
+        # density jumps across the LCFS), which needs more Krylov directions
+        # than the static solver's defaults to converge reliably
+        self.solver_kwargs = dict(_DEFAULT_STATIC_SOLVER_KWARGS)
+        if solver_kwargs is not None:
+            self.solver_kwargs.update(solver_kwargs)
         self.Raxis = Raxis
         self.Ip_logic = Ip_logic
         self.interpolator = interpolator
@@ -259,6 +271,212 @@ class StaticEquilibriumSolver:
         return imas_read_write.write_equilibrium_to_ids(
             self.eq, self.profiles, psi_n=self.psi_n, time=time
         )
+
+    def commit(self, time, equilibrium_ids):
+        """Accepts the last solve (no state to keep for the static solver)."""
+
+
+def _interpolated_profile_update(ids_start, ids_end, t_start, t_end):
+    """
+    Returns `update_profiles(profiles, time)` setting the plasma current and
+    the p', FF' profiles of a `GeneralPprimeFFprime` object by linear
+    interpolation in time between two equilibrium IDSs (each read in
+    FreeGSNKE's conventions). The profiles are interpolated on the normalised
+    flux grid of `ids_end`.
+    """
+    end = imas_read_write.read_profiles_from_equilibrium_ids(ids_end)
+    if ids_start is None or t_end <= t_start:
+        start = end
+    else:
+        start = imas_read_write.read_profiles_from_equilibrium_ids(ids_start)
+    psi_n = end["psi_n"]
+    pprime_start = np.interp(psi_n, start["psi_n"], start["pprime"])
+    ffprime_start = np.interp(psi_n, start["psi_n"], start["ffprime"])
+
+    def update_profiles(profiles, time):
+        if t_end <= t_start:
+            weight = 1.0
+        else:
+            weight = float(np.clip((time - t_start) / (t_end - t_start), 0.0, 1.0))
+        profiles.psi_n = psi_n
+        profiles.pprime_data = (1 - weight) * pprime_start + weight * end["pprime"]
+        profiles.ffprime_data = (1 - weight) * ffprime_start + weight * end["ffprime"]
+        profiles.p_data = None
+        profiles.f_data = None
+        profiles.Ip = (1 - weight) * start["Ip"] + weight * end["Ip"]
+        profiles.initialize_profile()
+
+    return update_profiles
+
+
+class EvolutiveEquilibriumSolver:
+    """
+    Free-boundary equilibrium provider for the loose coupling in which the coil
+    and passive-structure currents are evolved on the vessel timescale.
+
+    Over each coupling interval [t, t + dt] the metal circuit equations are
+    integrated with `metal_evolution.MetalCurrentsEvolution` in sub-steps of
+    `vessel_timestep`, driven by the applied coil voltages, while the plasma
+    current and the p', FF' profiles are prescribed by TORAX (interpolated
+    linearly in time between the IDS at t and the IDS at t + dt). At each
+    sub-step the equilibrium is the static free-boundary solution for the
+    instantaneous metal currents and profiles, so the vertical displacement and
+    eddy-current dynamics are resolved while the current diffusion remains
+    with TORAX.
+
+    Since `run_loose_coupling` iterates each coupling interval, the evolution
+    always restarts from the last committed state; `commit` is called by the
+    loop once the interval has converged.
+    """
+
+    def __init__(
+        self,
+        eq,
+        profiles,
+        active_voltages=None,
+        solver=None,
+        vessel_timestep=5e-4,
+        max_mode_frequency=None,
+        fixed_n_passive_modes=None,
+        psi_n=None,
+        fvac=None,
+        Raxis=1.0,
+        Ip_logic=True,
+        interpolator="univariate_spline",
+        verbose=False,
+        **evolution_kwargs,
+    ):
+        """
+        Parameters
+        ----------
+        eq : freegsnke.equilibrium_update.Equilibrium
+            Solved initial equilibrium, with the initial currents set on its
+            tokamak (active coils and passive structures).
+        profiles : freegsnke.jtor_update profile object
+            Profile object used to solve `eq`. A `GeneralPprimeFFprime` object
+            with the same `fvac` is used for the coupled evolution.
+        active_voltages : np.ndarray or callable, optional
+            Voltages applied to the active coils [V] (order of
+            `eq.tokamak.coils_list`): a constant vector or
+            `active_voltages(time, evolution)` (e.g. a
+            `metal_evolution.VerticalPositionController`). Defaults to the
+            steady-state voltages of the initial currents.
+        solver : freegsnke.GSstaticsolver.NKGSsolver, optional
+            Static solver; created if not provided.
+        vessel_timestep : float
+            Sub-step [s] of the metal current evolution.
+        max_mode_frequency : float, optional
+            Cut-off rate (1/s) of the retained passive-structure modes; see
+            `MetalCurrentsEvolution`.
+        fixed_n_passive_modes : int, optional
+            Alternatively, number of slowest passive modes to retain.
+        psi_n : np.array, optional
+            Normalised flux grid used when writing the equilibrium IDS.
+        fvac : float, optional
+            Vacuum field function R*Btor [T m]; defaults to `profiles.fvac()`.
+        Raxis, Ip_logic, interpolator
+            Passed to `GeneralPprimeFFprime`.
+        verbose : bool
+            Print information on each vessel sub-step.
+        **evolution_kwargs
+            Further keyword arguments for `MetalCurrentsEvolution` (tolerances,
+            relaxation, custom resistances/inductances).
+        """
+        self.eq = eq
+        self.psi_n = default_psi_n_grid() if psi_n is None else np.asarray(psi_n)
+        self.fvac = profiles.fvac() if fvac is None else fvac
+        self.initial_profiles = profiles
+        if isinstance(profiles, GeneralPprimeFFprime):
+            self.profiles = profiles
+        else:
+            # tabulate the initial profiles so that they can be updated from IDSs
+            initial_ids = imas_read_write.write_equilibrium_to_ids(
+                eq, profiles, psi_n=self.psi_n
+            )
+            self.profiles = imas_read_write.profiles_from_equilibrium_ids(
+                eq,
+                initial_ids,
+                fvac=self.fvac,
+                Raxis=Raxis,
+                Ip_logic=Ip_logic,
+                interpolator=interpolator,
+            )
+            # evaluate the tabulated profiles on the equilibrium (sets jtor)
+            self.profiles.Jtor(eq.R, eq.Z, eq.psi(), eq.psi_bndry)
+        self.evolution = MetalCurrentsEvolution(
+            eq,
+            self.profiles,
+            solver=solver,
+            vessel_timestep=vessel_timestep,
+            max_mode_frequency=max_mode_frequency,
+            fixed_n_passive_modes=fixed_n_passive_modes,
+            verbose=verbose,
+            **evolution_kwargs,
+        )
+        self.active_voltages = (
+            self.evolution.steady_state_voltages()
+            if active_voltages is None
+            else active_voltages
+        )
+        self.verbose = verbose
+        self.committed_state = self.evolution.snapshot()
+        self.committed_ids = None
+        self.n_solves = 0
+        self.substep_history = []
+
+    def initial_equilibrium_ids(self, time=0.0):
+        """Writes the initial equilibrium to an IDS and labels the state with `time`."""
+        self.evolution.set_time(time)
+        self.committed_state = self.evolution.snapshot()
+        return imas_read_write.write_equilibrium_to_ids(
+            self.eq, self.profiles, psi_n=self.psi_n, time=time
+        )
+
+    def solve(self, time, equilibrium_ids):
+        """
+        Evolves the metal currents from the last committed time to `time`,
+        with the plasma profiles interpolated between the last committed TORAX
+        IDS and `equilibrium_ids`, and returns the equilibrium IDS at `time`.
+        If `time` equals the committed time the equilibrium is re-solved at
+        fixed currents for the profiles in `equilibrium_ids`.
+        """
+        self.evolution.restore(self.committed_state)
+        t_start = self.committed_state.time
+        update_profiles = _interpolated_profile_update(
+            self.committed_ids, equilibrium_ids, t_start, time
+        )
+        if time - t_start < _MIN_RELATIVE_DT * self.evolution.vessel_timestep:
+            self.evolution.resolve_static(update_profiles=update_profiles)
+        else:
+            self.evolution.advance(
+                time, self.active_voltages, update_profiles=update_profiles
+            )
+        self.n_solves += 1
+        return imas_read_write.write_equilibrium_to_ids(
+            self.eq, self.profiles, psi_n=self.psi_n, time=time
+        )
+
+    def commit(self, time, equilibrium_ids):
+        """
+        Accepts the last `solve` as the state at `time`: the next interval
+        starts from it and interpolates the profiles from `equilibrium_ids`.
+        """
+        if abs(self.evolution.time - time) > _MIN_RELATIVE_DT * max(
+            self.evolution.vessel_timestep, abs(time)
+        ):
+            raise RuntimeError(
+                f"commit at t = {time} does not match the last solve at "
+                f"t = {self.evolution.time}."
+            )
+        n_previous = len(self.substep_history)
+        self.substep_history = [
+            h for h in self.substep_history if h["time"] < self.committed_state.time
+        ] + [
+            h for h in self.evolution.history if h["time"] >= self.committed_state.time
+        ]
+        del n_previous
+        self.committed_state = self.evolution.snapshot()
+        self.committed_ids = equilibrium_ids
 
 
 def torax_geometry_from_ids(equilibrium_ids, torax_config, Ip_from_parameters=True):
@@ -615,6 +833,9 @@ def run_loose_coupling(
             break
         guess_ids = relax_profiles(new_ids, guess_ids, relaxation)
 
+    if hasattr(equilibrium_solver, "commit"):
+        equilibrium_solver.commit(t_initial, guess_ids)
+
     state_history = [state]
     post_processed_history = [post_processed]
     equilibrium_ids_history = [eq_ids]
@@ -668,6 +889,8 @@ def run_loose_coupling(
 
         state, post_processed, geo = new_state, new_post_processed, geo_next
         t = float(state.t)
+        if hasattr(equilibrium_solver, "commit"):
+            equilibrium_solver.commit(t, new_ids)
         state_history.append(state)
         post_processed_history.append(post_processed)
         equilibrium_ids_history.append(eq_ids)
