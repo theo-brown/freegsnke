@@ -15,6 +15,7 @@ cp "../examples/example07 - static_inverse_solve_SPARC.ipynb" notebooks
 cp "../examples/example08 - static_inverse_solve_ITER.ipynb" notebooks
 cp "../examples/example09 - virtual_circuits_MASTU.ipynb" notebooks
 cp "../examples/example10 - growth_rates.ipynb" notebooks
+cp "../examples/example12 - loose_coupling_with_TORAX.ipynb" notebooks
 cp -r ../examples/data notebooks
 
 echo "Copying images"

@@ -31,6 +31,7 @@ FreeGSNKE uses [FreeGS4E](https://github.com/FusionComputingLab/freegs4e), an LG
 - [Installation](#installation)
   - [Installing with pip](#installing-with-pip)
   - [Installing with UDA](#installing-with-uda)
+  - [Coupling with TORAX](#coupling-with-torax)
   - [Installing from source](#installing-from-source)
   - [Extras (for contributing)](#extras-for-contributing)
 - [Contributing](#contributing)
@@ -85,7 +86,7 @@ FreeGSNKE is constantly evolving and so we hope to provide users with more advan
 
 **Long term**:
 - Implementation of the current diffusion equation. 
-- Coupling with transport solvers. 
+- Coupling with transport solvers (a loose coupling with [TORAX](https://github.com/google-deepmind/torax) via IMAS equilibrium IDSs is available, see [below](#coupling-with-torax)). 
 - Coupling with [MOOSE](https://mooseframework.inl.gov/) to quantify electromagnetic loads on tokamak structures during vertical displacement events. 
 
 
@@ -156,6 +157,18 @@ FreeGSNKE also interfaces with [UDA](https://github.com/ukaea/UDA), for example,
    ```shell
    pip install "uda-mast @ git+ssh://git@gitlab.ukaea.uk/MAST-U/mastcodes.git@1.3.10#subdirectory=uda/python"
    ```
+
+### Coupling with TORAX
+
+FreeGSNKE can be loosely coupled to the [TORAX](https://github.com/google-deepmind/torax) core transport code: TORAX evolves the kinetic profiles and the current diffusion, FreeGSNKE solves the free-boundary equilibrium for the resulting `p'(ψ)` and `FF'(ψ)` profiles, and the two are interleaved and iterated to convergence over each coupling interval. The IMAS `equilibrium` IDS is used as the interchange format in both directions. See the `freegsnke.torax_coupling` module and the example notebook `example12 - loose_coupling_with_TORAX.ipynb`.
+
+TORAX is an optional dependency:
+
+   ```shell
+   pip install freegsnke[torax]
+   ```
+
+Note that the released TORAX pins a different `imas-python` version to FreeGSNKE, in which case `pip` cannot resolve `freegsnke[torax]` directly. In that case install TORAX first and then install FreeGSNKE with `pip install --no-deps freegsnke` (plus its remaining requirements from `requirements.txt`); the coupling works with the `imas-python` version installed by TORAX.
 
 ### Installing from source
 

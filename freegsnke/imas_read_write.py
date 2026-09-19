@@ -30,8 +30,86 @@ from scipy.interpolate import RectBivariateSpline
 
 import freegsnke
 
+# The IMAS equilibrium IDS is written in the data dictionary's COCOS 17
+# convention: poloidal flux in Wb (i.e. including the 2*pi factor) whereas
+# FreeGSNKE (like FreeGS) works in Wb/rad. Derivatives with respect to the
+# poloidal flux (dp/dpsi, FF') are therefore rescaled by this factor on
+# write/read.
+_PSI_IDS_OVER_PSI_FREEGSNKE = 2 * np.pi
 
-def _flux_surface_geometry(eq, psi_n, fpol_1d):
+# number of points used when integrating p' and FF' to obtain p and F
+_N_PROFILE_INTEGRATION_POINTS = 4001
+
+# number of innermost flux surfaces used to extrapolate q to the magnetic axis
+_N_SURFACES_FOR_AXIS_EXTRAPOLATION = 4
+
+_IDS_FACTORY = None
+
+
+def _ids_factory():
+    """
+    Returns a module-level cached `imas.IDSFactory` (parsing the data
+    dictionary is expensive and only needs doing once per session).
+    """
+    global _IDS_FACTORY
+    if _IDS_FACTORY is None:
+        _IDS_FACTORY = imas.IDSFactory()
+    return _IDS_FACTORY
+
+
+def _integrated_profiles(profiles, psi_n, psi_axis, psi_bndry):
+    """
+    Evaluates the pressure and toroidal field function profiles by integrating
+    the (normalised) p' and FF' profiles from the plasma boundary inwards:
+
+        p(psi_n) = (psi_axis - psi_bndry) * integral_{psi_n}^{1} p'(x) dx,
+        F(psi_n)^2 = fvac^2 + 2 (psi_axis - psi_bndry) * integral_{psi_n}^{1} FF'(x) dx,
+
+    which is the same definition used by `freegs4e.jtor.Profile.pressure` and
+    `freegs4e.jtor.Profile.fpol`, evaluated with a single vectorised
+    cumulative trapezoidal integration on a fine grid rather than one adaptive
+    quadrature per point.
+
+    Parameters
+    ----------
+    profiles : freegsnke.jtor_update profile object
+        Profile object (with `pprime`, `ffprime` and `fvac` methods).
+    psi_n : np.array
+        Normalised flux values at which to evaluate the profiles.
+    psi_axis : float
+        Poloidal flux on the magnetic axis [Wb/rad].
+    psi_bndry : float
+        Poloidal flux on the plasma boundary [Wb/rad].
+
+    Returns
+    -------
+    pressure : np.array
+        Pressure at each value of `psi_n` [Pa].
+    fpol : np.array
+        F = R*Btor at each value of `psi_n` [T m].
+    """
+
+    fine = np.linspace(0.0, 1.0, _N_PROFILE_INTEGRATION_POINTS)
+    dpsi = psi_axis - psi_bndry
+
+    pprime_fine = np.asarray(profiles.pprime(fine), dtype=float)
+    ffprime_fine = np.asarray(profiles.ffprime(fine), dtype=float)
+
+    # integral from psi_n to 1 = total integral - cumulative integral from 0
+    int_pprime = cumulative_trapezoid(pprime_fine, fine, initial=0.0)
+    int_pprime = int_pprime[-1] - int_pprime
+    int_ffprime = cumulative_trapezoid(ffprime_fine, fine, initial=0.0)
+    int_ffprime = int_ffprime[-1] - int_ffprime
+
+    psi_n = np.clip(np.asarray(psi_n, dtype=float), 0.0, 1.0)
+    pressure = np.interp(psi_n, fine, int_pprime * dpsi)
+    fpol = np.interp(
+        psi_n, fine, np.sqrt(2.0 * int_ffprime * dpsi + profiles.fvac() ** 2)
+    )
+    return pressure, fpol
+
+
+def _flux_surface_geometry(eq, psi_n, fpol_1d, fields_2d=None):
     """
     Traces each requested normalised-flux surface once (via `contourpy`, the
     same technique used by `eq.flux_averaged_function`) and returns the
@@ -48,6 +126,10 @@ def _flux_surface_geometry(eq, psi_n, fpol_1d):
         F = R*Btor at each value in `psi_n` (e.g. `profiles.fpol(psi_n)`).
         F is constant on a flux surface, so this gives Btor = F/R at every
         traced point without any extra profile evaluation.
+    fields_2d : dict, optional
+        Mapping from a name to a 2D field interpolator (callable as
+        `f(R, Z, grid=False)`, e.g. a `RectBivariateSpline`). The flux
+        surface average of each field is returned under `avg_<name>`.
 
     Returns
     -------
@@ -67,9 +149,15 @@ def _flux_surface_geometry(eq, psi_n, fpol_1d):
             (see `write_equilibrium_to_ids`).
         `avg_B2`, `avg_inv_B2` : flux-surface averages <B^2>, <1/B^2> of the
             *total* field (poloidal + toroidal), for gm5/gm4.
+        `avg_<name>` : flux-surface average of each field in `fields_2d`.
     """
 
-    masked_psi = np.ma.array(eq.psiNRZ(R=eq.R, Z=eq.Z), mask=eq.mask_outside_limiter)
+    if fields_2d is None:
+        fields_2d = {}
+
+    # normalised total flux on the grid (from the cached plasma + coil fluxes)
+    psi_n_2d = (eq.psi() - eq.psi_axis) / (eq.psi_bndry - eq.psi_axis)
+    masked_psi = np.ma.array(psi_n_2d, mask=eq.mask_outside_limiter)
     mag_r, mag_z = eq.magneticAxis()[0:2]
 
     # total-psi spline, reused for cheap Br/Bz on each surface (see the
@@ -98,6 +186,7 @@ def _flux_surface_geometry(eq, psi_n, fpol_1d):
             "avg_B2",
             "avg_inv_B2",
         ]
+        + [f"avg_{name}" for name in fields_2d]
     }
 
     # loop over each poloidal flux surface
@@ -135,6 +224,10 @@ def _flux_surface_geometry(eq, psi_n, fpol_1d):
         result["avg_B2"][i] = flux_average(B2)
         result["avg_inv_B2"][i] = flux_average(1 / B2)
 
+        # any additional 2D fields
+        for name, field in fields_2d.items():
+            result[f"avg_{name}"][i] = flux_average(field(Rc, Zc, grid=False))
+
         # Miller-style shape parameters
         Rmax_i, Rmin_i = np.max(Rc), np.min(Rc)
         Zmax_i, Zmin_i = np.max(Zc), np.min(Zc)
@@ -170,10 +263,16 @@ def _flux_surface_geometry(eq, psi_n, fpol_1d):
 def write_equilibrium_to_ids(
     eq,
     profiles,
+    psi_n=None,
+    time=0.0,
 ):
     """
     Populates an IMAS `equilibrium` IDS (single time slice) with quantities taken
     from a solved FreeGSNKE equilibrium.
+
+    The IDS follows the IMAS data dictionary convention (COCOS 17): the poloidal
+    flux is stored in Wb (FreeGSNKE's Wb/rad multiplied by 2*pi) and the
+    derivatives `dpressure_dpsi` and `f_df_dpsi` are with respect to that flux.
 
     Parameters
     ----------
@@ -182,6 +281,17 @@ def write_equilibrium_to_ids(
     profiles : freegsnke.jtor_update profile object
         The profile object used to solve for `eq` (e.g. a `ConstrainPaxisIp` or
         `GeneralPprimeFFprime` instance).
+    psi_n : np.array, optional
+        Normalised poloidal flux values of the flux surfaces on which the 1D
+        profiles are written. Values must lie strictly inside (0, 1) since flux
+        surfaces cannot be traced on the axis or (for diverted plasmas) on the
+        separatrix. Defaults to `eq.nx` points clipped to [0.01, 0.99]. The
+        magnetic axis (psi_norm = 0) and near-axis points between the axis and
+        the innermost surface are always prepended to the 1D profiles, with
+        their values prescribed from the leading-order near-axis behaviour of
+        each quantity.
+    time : float, optional
+        Time [s] assigned to the IDS time slice (default 0.0).
 
     Returns
     -------
@@ -190,8 +300,7 @@ def write_equilibrium_to_ids(
     """
 
     # initialise an empty equilibrium IDS
-    ids_factory = imas.IDSFactory()
-    ids_out = ids_factory.equilibrium()
+    ids_out = _ids_factory().equilibrium()
 
     # high-level ids properties
     ids_out.ids_properties.name = "FreeGSNKE-generated equilibrium IDS"
@@ -211,15 +320,15 @@ def write_equilibrium_to_ids(
     ids_out.vacuum_toroidal_field.r0 = rcentr
     ids_out.vacuum_toroidal_field.b0 = np.array([profiles.fvac() / rcentr])
 
-    ids_out.time = np.array([0.0])
+    ids_out.time = np.array([float(time)])
     ids_out.time_slice.resize(1)
     time_slice = ids_out.time_slice[0]
-    time_slice.time = 0.0
+    time_slice.time = float(time)
 
     # boundary quantities
     time_slice.boundary.type = 1 - profiles.flag_limiter  # 0 = limited, 1 = diverted
     time_slice.boundary.psi_norm = 1.0
-    time_slice.boundary.psi = 2 * np.pi * eq.psi_bndry
+    time_slice.boundary.psi = _PSI_IDS_OVER_PSI_FREEGSNKE * eq.psi_bndry
     time_slice.boundary.minor_radius = eq.minorRadius()
     boundary = eq.separatrix(ntheta=360)
     time_slice.boundary.outline.r = boundary[:, 0]
@@ -227,8 +336,10 @@ def write_equilibrium_to_ids(
 
     # global quantities
     time_slice.global_quantities.ip = eq.plasmaCurrent()
-    time_slice.global_quantities.psi_axis = 2 * np.pi * eq.psi_axis
-    time_slice.global_quantities.psi_boundary = 2 * np.pi * eq.psi_bndry
+    time_slice.global_quantities.psi_axis = _PSI_IDS_OVER_PSI_FREEGSNKE * eq.psi_axis
+    time_slice.global_quantities.psi_boundary = (
+        _PSI_IDS_OVER_PSI_FREEGSNKE * eq.psi_bndry
+    )
     mag_r, mag_z = eq.magneticAxis()[0:2]
     time_slice.global_quantities.magnetic_axis.r = mag_r
     time_slice.global_quantities.magnetic_axis.z = mag_z
@@ -237,70 +348,154 @@ def write_equilibrium_to_ids(
     # boundary values (0, 1): q (and everything derived from it below) is
     # singular there, and eq.psiN_1D(N) would otherwise include them exactly.
     # Matches the default clip range already used by eq.flux_averaged_function.
-    N = eq.nx
-    psi_n = np.clip(eq.psiN_1D(N), 0.01, 0.99)
-    psi_actual = eq.psi_axis + psi_n * (eq.psi_bndry - eq.psi_axis)
-
-    time_slice.profiles_1d.psi = (2 * np.pi * psi_actual).squeeze()
-    time_slice.profiles_1d.psi_norm = psi_n.squeeze()
-    time_slice.profiles_1d.pressure = profiles.pressure(psi_n).squeeze()
-    fpol_1d = profiles.fpol(psi_n)
-    time_slice.profiles_1d.f = fpol_1d.squeeze()
-    time_slice.profiles_1d.dpressure_dpsi = profiles.pprime(psi_n).squeeze()
-    time_slice.profiles_1d.f_df_dpsi = profiles.ffprime(psi_n).squeeze()
-    q_1d = eq.q(psi_n)
-    time_slice.profiles_1d.q = q_1d.squeeze()
-
-    # flux-averaged toroidal current density
-    jtor_interp = RectBivariateSpline(eq.R_1D, eq.Z_1D, profiles.jtor)
-    flux_averaged_jtor, _ = eq.flux_averaged_function(
-        f=lambda R, Z: jtor_interp(R, Z, grid=False),
-        psi_n=psi_n,
+    if psi_n is None:
+        N = eq.nx
+        psi_n = np.clip(eq.psiN_1D(N), 0.01, 0.99)
+    psi_n_surfaces = np.asarray(psi_n, dtype=float).reshape(-1)
+    if (
+        np.any(psi_n_surfaces <= 0.0)
+        or np.any(psi_n_surfaces >= 1.0)
+        or np.any(np.diff(psi_n_surfaces) <= 0)
+    ):
+        raise ValueError(
+            "psi_n must be strictly increasing and lie strictly inside (0, 1)."
+        )
+    # The 1D profiles are written on the magnetic axis (psi_n = 0, where the
+    # values are prescribed analytically since no flux surface can be traced),
+    # on near-axis fill points (see below) and on the requested flux surfaces.
+    # F (constant on each surface) is needed for the flux surface tracing.
+    _, fpol_surfaces = _integrated_profiles(
+        profiles, psi_n_surfaces, eq.psi_axis, eq.psi_bndry
     )
-    time_slice.profiles_1d.j_phi = flux_averaged_jtor.squeeze()
 
-    # Remaining profiles all derive from one pass of flux-surface tracing
-    geom = _flux_surface_geometry(eq, psi_n, fpol_1d)
+    # safety factor on the flux surfaces, extrapolated to the axis with a
+    # low-order polynomial in psi_n (q is smooth in psi near the axis)
+    q_surfaces = np.asarray(eq.q(psi_n_surfaces)).reshape(-1)
+    n_fit = min(_N_SURFACES_FOR_AXIS_EXTRAPOLATION, len(psi_n_surfaces))
+    q_axis_fit = np.polyfit(
+        psi_n_surfaces[:n_fit], q_surfaces[:n_fit], deg=min(2, n_fit - 1)
+    )
+    q_axis = np.polyval(q_axis_fit, 0.0)
 
+    # Remaining profiles (including the flux-averaged toroidal current density)
+    # all derive from one pass of flux-surface tracing
+    jtor_interp = RectBivariateSpline(eq.R_1D, eq.Z_1D, profiles.jtor)
+    geom = _flux_surface_geometry(
+        eq, psi_n_surfaces, fpol_surfaces, fields_2d={"jtor": jtor_interp}
+    )
+    mag_r, mag_z = eq.magneticAxis()[0:2]
+    jtor_axis = float(jtor_interp(mag_r, mag_z, grid=False))
+
+    # Flux surfaces very close to the axis cannot be traced reliably on the
+    # computational grid, which would leave a gap in the profiles between the
+    # axis and the innermost traced surface (sqrt(psi_n_min) in the normalised
+    # radius). The gap is filled with the leading-order near-axis behaviour of
+    # each quantity: with s = rho/rho_1 (rho_1 the innermost surface, rho the
+    # near-axis flux surface radius, so psi_n = s^2 psi_n_1 and s ~ sqrt(psi_n)),
+    # even quantities vary as a + b s^2, Bp ~ s, |grad(rho)| ~ 1, enclosed
+    # volume ~ s^2 and the midplane radii ~ s. The fill spacing in s matches
+    # that of the innermost traced surfaces.
+    psi_n_1 = psi_n_surfaces[0]
+    n_fill = 1
+    if len(psi_n_surfaces) > 1:
+        ds_surfaces = np.sqrt(psi_n_surfaces[1]) - np.sqrt(psi_n_1)
+        n_fill = max(1, int(round(np.sqrt(psi_n_1) / ds_surfaces)))
+    s_fill = np.arange(1, n_fill) / n_fill
+    psi_n_fill = s_fill**2 * psi_n_1
+
+    def assemble(axis_value, fill_values, surface_values):
+        return np.concatenate(
+            (
+                [axis_value],
+                np.asarray(fill_values, dtype=float).reshape(-1),
+                np.asarray(surface_values, dtype=float).reshape(-1),
+            )
+        )
+
+    def even(axis_value, key):
+        # a + b s^2 between the axis and the innermost surface
+        return assemble(
+            axis_value, axis_value + s_fill**2 * (geom[key][0] - axis_value), geom[key]
+        )
+
+    psi_n = np.concatenate(([0.0], psi_n_fill, psi_n_surfaces))
+    psi_actual = eq.psi_axis + psi_n * (eq.psi_bndry - eq.psi_axis)
+    time_slice.profiles_1d.psi = _PSI_IDS_OVER_PSI_FREEGSNKE * psi_actual
+    time_slice.profiles_1d.psi_norm = psi_n
+    pressure_1d, fpol_1d = _integrated_profiles(
+        profiles, psi_n, eq.psi_axis, eq.psi_bndry
+    )
+    time_slice.profiles_1d.pressure = pressure_1d
+    time_slice.profiles_1d.f = fpol_1d
+    btor_axis = fpol_1d[0] / mag_r
+    time_slice.profiles_1d.dpressure_dpsi = (
+        np.asarray(profiles.pprime(psi_n)).reshape(-1) / _PSI_IDS_OVER_PSI_FREEGSNKE
+    )
+    time_slice.profiles_1d.f_df_dpsi = (
+        np.asarray(profiles.ffprime(psi_n)).reshape(-1) / _PSI_IDS_OVER_PSI_FREEGSNKE
+    )
+    q_1d = np.concatenate(([q_axis], np.polyval(q_axis_fit, psi_n_fill), q_surfaces))
+    time_slice.profiles_1d.q = q_1d
+    time_slice.profiles_1d.j_phi = even(jtor_axis, "avg_jtor")
+
+    # toroidal flux from dphi/dpsi = q (psi here in Wb, hence the 2*pi)
     psi_mag = psi_n * abs(eq.psi_bndry - eq.psi_axis)
     phi_1d = cumulative_trapezoid(2 * np.pi * q_1d, psi_mag, initial=0.0)
-    phi_1d = phi_1d + 2 * np.pi * q_1d[0] * psi_mag[0]  # innermost wedge
 
     b0 = ids_out.vacuum_toroidal_field.b0[0]
     rho_tor = np.sqrt(phi_1d / (np.pi * b0))
     rho_tor_norm = np.sqrt(phi_1d / phi_1d[-1])
-    drho_dpsi_mag = q_1d / (b0 * rho_tor)
-    gm1 = geom["avg_inv_R2"]  # <1/R^2>
-    gm2 = drho_dpsi_mag**2 * geom["avg_Bp2"]  # <|grad(rho_tor)|^2/R^2>
-    gm3 = drho_dpsi_mag**2 * geom["avg_R2_Bp2"]  # <|grad(rho_tor)|^2>
-    gm4 = geom["avg_inv_B2"]  # <1/B^2>
-    gm5 = geom["avg_B2"]  # <B^2>
-    gm7 = drho_dpsi_mag * geom["avg_R_Bp"]  # <|grad(rho_tor)|>
-    gm9 = geom["avg_inv_R"]  # <1/R>
+    # d(rho_tor)/d(psi_mag) off axis (singular on axis)
+    drho_dpsi_mag = q_1d[1:] / (b0 * rho_tor[1:])
+    avg_Bp2 = assemble(0.0, s_fill**2 * geom["avg_Bp2"][0], geom["avg_Bp2"])
+    avg_R2_Bp2 = assemble(0.0, s_fill**2 * geom["avg_R2_Bp2"][0], geom["avg_R2_Bp2"])
+    avg_R_Bp = assemble(0.0, s_fill * geom["avg_R_Bp"][0], geom["avg_R_Bp"])
+    # On axis: <1/R^n> -> 1/R_axis^n, |grad(rho_tor)| -> 1 and B -> Btor(axis).
+    gm1 = even(1 / mag_r**2, "avg_inv_R2")  # <1/R^2>
+    gm2 = np.concatenate(
+        ([1 / mag_r**2], drho_dpsi_mag**2 * avg_Bp2[1:])
+    )  # <|grad(rho_tor)|^2/R^2>
+    gm3 = np.concatenate(
+        ([1.0], drho_dpsi_mag**2 * avg_R2_Bp2[1:])
+    )  # <|grad(rho_tor)|^2>
+    gm4 = even(1 / btor_axis**2, "avg_inv_B2")  # <1/B^2>
+    gm5 = even(btor_axis**2, "avg_B2")  # <B^2>
+    gm7 = np.concatenate(([1.0], drho_dpsi_mag * avg_R_Bp[1:]))  # <|grad(rho_tor)|>
+    gm9 = even(1 / mag_r, "avg_inv_R")  # <1/R>
 
-    time_slice.profiles_1d.gm1 = gm1.squeeze()
-    time_slice.profiles_1d.gm2 = gm2.squeeze()
-    time_slice.profiles_1d.gm3 = gm3.squeeze()
-    time_slice.profiles_1d.gm4 = gm4.squeeze()
-    time_slice.profiles_1d.gm5 = gm5.squeeze()
-    time_slice.profiles_1d.gm7 = gm7.squeeze()
-    time_slice.profiles_1d.gm9 = gm9.squeeze()
+    time_slice.profiles_1d.gm1 = gm1
+    time_slice.profiles_1d.gm2 = gm2
+    time_slice.profiles_1d.gm3 = gm3
+    time_slice.profiles_1d.gm4 = gm4
+    time_slice.profiles_1d.gm5 = gm5
+    time_slice.profiles_1d.gm7 = gm7
+    time_slice.profiles_1d.gm9 = gm9
 
-    time_slice.profiles_1d.phi = phi_1d.squeeze()
-    time_slice.profiles_1d.rho_tor_norm = rho_tor_norm.squeeze()
-    time_slice.profiles_1d.r_inboard = geom["r_inboard"].squeeze()
-    time_slice.profiles_1d.r_outboard = geom["r_outboard"].squeeze()
-    time_slice.profiles_1d.volume = geom["volume"].squeeze()
-    time_slice.profiles_1d.elongation = geom["elongation"].squeeze()
-    time_slice.profiles_1d.triangularity_upper = geom["triangularity_upper"].squeeze()
-    time_slice.profiles_1d.triangularity_lower = geom["triangularity_lower"].squeeze()
+    time_slice.profiles_1d.phi = phi_1d
+    time_slice.profiles_1d.rho_tor = rho_tor
+    time_slice.profiles_1d.rho_tor_norm = rho_tor_norm
+    time_slice.profiles_1d.r_inboard = assemble(
+        mag_r, mag_r + s_fill * (geom["r_inboard"][0] - mag_r), geom["r_inboard"]
+    )
+    time_slice.profiles_1d.r_outboard = assemble(
+        mag_r, mag_r + s_fill * (geom["r_outboard"][0] - mag_r), geom["r_outboard"]
+    )
+    time_slice.profiles_1d.volume = assemble(
+        0.0, s_fill**2 * geom["volume"][0], geom["volume"]
+    )
+    for key in ["elongation", "triangularity_upper", "triangularity_lower"]:
+        setattr(
+            time_slice.profiles_1d,
+            key,
+            assemble(geom[key][0], np.full(len(s_fill), geom[key][0]), geom[key]),
+        )
 
     # 2D fields (total, plasma, and tokamak flux - jtor also stored)
     tokamak_psi = eq.tokamak.getPsitokamak(eq._vgreen)
     two_d_fields = [
-        (0, "total", 2 * np.pi * eq.psi(), profiles.jtor),
-        (4, "plasma", 2 * np.pi * eq.plasma_psi, None),
-        (1, "vacuum", 2 * np.pi * tokamak_psi, None),
+        (0, "total", _PSI_IDS_OVER_PSI_FREEGSNKE * eq.psi(), profiles.jtor),
+        (4, "plasma", _PSI_IDS_OVER_PSI_FREEGSNKE * eq.plasma_psi, None),
+        (1, "vacuum", _PSI_IDS_OVER_PSI_FREEGSNKE * tokamak_psi, None),
     ]
 
     time_slice.profiles_2d.resize(len(two_d_fields))
@@ -353,3 +548,204 @@ def load_equilibrium_ids(path):
 
     with imas.DBEntry(path, "r") as db_entry:
         return db_entry.get("equilibrium")
+
+
+def _strictly_increasing(psi_n):
+    """
+    Returns a copy of `psi_n` with any non-increasing steps removed (a strictly
+    increasing grid is required by the spline interpolators in the profile
+    classes). Repeated or decreasing values, which can arise from round-off
+    near the axis/boundary, are nudged by a tiny amount.
+    """
+    psi_n = np.array(psi_n, dtype=float)
+    for i in range(1, len(psi_n)):
+        if psi_n[i] <= psi_n[i - 1]:
+            psi_n[i] = np.nextafter(psi_n[i - 1], np.inf)
+    return psi_n
+
+
+def read_profiles_from_equilibrium_ids(ids, slice_index=0):
+    """
+    Extracts the p' and FF' profiles (and the associated scalars) from an IMAS
+    `equilibrium` IDS in FreeGSNKE's conventions, ready to be used with a
+    `GeneralPprimeFFprime` profile object.
+
+    The IDS is assumed to follow the IMAS data dictionary convention (COCOS 17,
+    psi in Wb) as written by `write_equilibrium_to_ids` or by other codes such as
+    TORAX. FreeGSNKE uses psi in Wb/rad with the flux decreasing from the
+    magnetic axis to the boundary for a positive plasma current. If the IDS flux
+    increases outwards (which in COCOS 17 corresponds to a negative plasma
+    current) the sign of the derivatives is flipped so that the returned profiles
+    describe the same plasma with a positive current in FreeGSNKE's convention.
+
+    Parameters
+    ----------
+    ids : imas.ids_toplevel.IDSToplevel
+        The `equilibrium` IDS.
+    slice_index : int
+        Index of the time slice to read.
+
+    Returns
+    -------
+    dict
+        `psi_n` : strictly increasing normalised poloidal flux grid.
+        `pprime` : dp/dpsi at `psi_n` [Pa/(Wb/rad)].
+        `ffprime` : F dF/dpsi at `psi_n` [T^2 m^2/(Wb/rad)].
+        `Ip` : plasma current magnitude [A].
+        `fvac` : vacuum toroidal field function magnitude |R*Btor| [T m].
+        `psi_axis`, `psi_bndry` : poloidal flux on axis/boundary [Wb/rad].
+        `time` : time of the slice [s].
+    """
+
+    time_slice = ids.time_slice[slice_index]
+    profiles_1d = time_slice.profiles_1d
+
+    psi = np.asarray(profiles_1d.psi, dtype=float)
+    if time_slice.global_quantities.psi_axis.has_value:
+        psi_axis = float(time_slice.global_quantities.psi_axis)
+    else:
+        psi_axis = psi[0]
+    if time_slice.global_quantities.psi_boundary.has_value:
+        psi_bndry = float(time_slice.global_quantities.psi_boundary)
+    else:
+        psi_bndry = psi[-1]
+
+    if profiles_1d.psi_norm.has_value:
+        psi_n = np.asarray(profiles_1d.psi_norm, dtype=float)
+    else:
+        psi_n = (psi - psi_axis) / (psi_bndry - psi_axis)
+
+    pprime = np.asarray(profiles_1d.dpressure_dpsi, dtype=float)
+    ffprime = np.asarray(profiles_1d.f_df_dpsi, dtype=float)
+    if pprime.size == 0 or ffprime.size == 0:
+        raise ValueError(
+            "The equilibrium IDS must contain profiles_1d.dpressure_dpsi and "
+            "profiles_1d.f_df_dpsi."
+        )
+    if not (
+        np.all(np.isfinite(psi_n))
+        and np.all(np.isfinite(pprime))
+        and np.all(np.isfinite(ffprime))
+    ):
+        raise ValueError(
+            "The equilibrium IDS profiles (psi_norm, dpressure_dpsi, f_df_dpsi) "
+            "contain non-finite values."
+        )
+
+    # COCOS 17 -> FreeGSNKE (Wb -> Wb/rad, and flux decreasing outwards)
+    sign = -1.0 if psi_bndry > psi_axis else 1.0
+    scale = sign * _PSI_IDS_OVER_PSI_FREEGSNKE
+
+    Ip = abs(float(time_slice.global_quantities.ip))
+    b0 = np.asarray(ids.vacuum_toroidal_field.b0, dtype=float)
+    b0 = b0[slice_index] if b0.size > 1 else b0[0]
+    fvac = abs(b0 * float(ids.vacuum_toroidal_field.r0))
+
+    return {
+        "psi_n": _strictly_increasing(psi_n),
+        "pprime": scale * pprime,
+        "ffprime": scale * ffprime,
+        "Ip": Ip,
+        "fvac": fvac,
+        "psi_axis": sign * psi_axis / _PSI_IDS_OVER_PSI_FREEGSNKE,
+        "psi_bndry": sign * psi_bndry / _PSI_IDS_OVER_PSI_FREEGSNKE,
+        "time": (
+            float(time_slice.time)
+            if time_slice.time.has_value
+            else float(np.asarray(ids.time, dtype=float)[slice_index])
+        ),
+    }
+
+
+def profiles_from_equilibrium_ids(
+    eq,
+    ids,
+    slice_index=0,
+    Ip=None,
+    fvac=None,
+    Raxis=1.0,
+    Ip_logic=True,
+    interpolator="univariate_spline",
+):
+    """
+    Builds a `GeneralPprimeFFprime` profile object from the p' and FF' profiles
+    stored in an IMAS `equilibrium` IDS (see `read_profiles_from_equilibrium_ids`
+    for the conventions used).
+
+    Parameters
+    ----------
+    eq : freegsnke.equilibrium_update.Equilibrium
+        Equilibrium object defining the grid and limiter.
+    ids : imas.ids_toplevel.IDSToplevel
+        The `equilibrium` IDS.
+    slice_index : int
+        Index of the time slice to read.
+    Ip : float, optional
+        Plasma current [A]. Defaults to the magnitude of the IDS value.
+    fvac : float, optional
+        Vacuum field function R*Btor [T m]. Defaults to the magnitude of the IDS
+        value (b0*r0).
+    Raxis : float
+        Radial scaling parameter passed to `GeneralPprimeFFprime`.
+    Ip_logic : bool
+        If True, the current density is renormalised to match `Ip` exactly.
+    interpolator : str
+        Interpolator passed to `GeneralPprimeFFprime`.
+
+    Returns
+    -------
+    freegsnke.jtor_update.GeneralPprimeFFprime
+        The profile object.
+    """
+
+    # imported here to avoid a circular import at module load time
+    from .jtor_update import GeneralPprimeFFprime
+
+    data = read_profiles_from_equilibrium_ids(ids, slice_index=slice_index)
+    return GeneralPprimeFFprime(
+        eq=eq,
+        Ip=data["Ip"] if Ip is None else Ip,
+        fvac=data["fvac"] if fvac is None else fvac,
+        psi_n=data["psi_n"],
+        pprime_data=data["pprime"],
+        ffprime_data=data["ffprime"],
+        Raxis=Raxis,
+        Ip_logic=Ip_logic,
+        interpolator=interpolator,
+    )
+
+
+def update_profiles_from_equilibrium_ids(profiles, ids, slice_index=0, Ip=None):
+    """
+    Updates an existing `GeneralPprimeFFprime` profile object in place with the
+    p' and FF' profiles stored in an IMAS `equilibrium` IDS (see
+    `read_profiles_from_equilibrium_ids` for the conventions used). This avoids
+    rebuilding the grid-dependent state of the profile object when the profiles
+    are exchanged repeatedly, e.g. when coupling to a transport code.
+
+    Parameters
+    ----------
+    profiles : freegsnke.jtor_update.GeneralPprimeFFprime
+        The profile object to update.
+    ids : imas.ids_toplevel.IDSToplevel
+        The `equilibrium` IDS.
+    slice_index : int
+        Index of the time slice to read.
+    Ip : float, optional
+        Plasma current [A]. Defaults to the magnitude of the IDS value.
+
+    Returns
+    -------
+    freegsnke.jtor_update.GeneralPprimeFFprime
+        The (same) updated profile object.
+    """
+
+    data = read_profiles_from_equilibrium_ids(ids, slice_index=slice_index)
+    profiles.psi_n = data["psi_n"]
+    profiles.pprime_data = data["pprime"]
+    profiles.ffprime_data = data["ffprime"]
+    profiles.p_data = None
+    profiles.f_data = None
+    profiles.Ip = data["Ip"] if Ip is None else Ip
+    profiles.initialize_profile()
+    return profiles

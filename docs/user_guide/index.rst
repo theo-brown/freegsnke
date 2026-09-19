@@ -24,3 +24,4 @@ The notebooks are displayed statically on the following pages, but running them 
     ../notebooks/example08 - static_inverse_solve_ITER
     ../notebooks/example09 - virtual_circuits_MASTU
     ../notebooks/example10 - growth_rates
+    ../notebooks/example12 - loose_coupling_with_TORAX
