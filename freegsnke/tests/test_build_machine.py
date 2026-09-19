@@ -349,6 +349,23 @@ def test_in_memory_machine_builds_active_and_passive_variants(tiny_machine_data)
     assert np.allclose(tokamak.coil_self_ind, tokamak.coil_self_ind.T)
 
 
+def test_array_valued_coil_sizes_give_scalar_resistances(tiny_machine_data):
+    """One-element array dR/dZ (as in some pickled machine descriptions,
+    e.g. the ITER one) must build the same resistances as scalar values."""
+    reference = _build_tiny_tokamak(tiny_machine_data)
+    data = deepcopy(tiny_machine_data)
+    data["active_coils"]["TinySingle"]["dR"] = np.array([0.05])
+    data["active_coils"]["TinySingle"]["dZ"] = np.array([0.04])
+    for group in data["active_coils"]["TinyCircuit"].values():
+        group["dR"] = np.array([0.03])
+        group["dZ"] = np.array([0.03])
+    tokamak = _build_tiny_tokamak(data)
+
+    assert tokamak.coil_resist.shape == (4,)
+    assert np.allclose(tokamak.coil_resist, reference.coil_resist)
+    assert np.allclose(tokamak.coil_self_ind, reference.coil_self_ind)
+
+
 def test_latin_hypercube_refinement_builds_polygon_passive(tiny_machine_data):
     """Cover the LH passive refinement path with deterministic direct input data."""
     tokamak = _build_tiny_tokamak(tiny_machine_data, refine_mode="LH")

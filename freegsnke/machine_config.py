@@ -290,10 +290,16 @@ def _calc_resistance_entry(tokamak, coil_name):
     """Calculate the unscaled resistance entry for one coil label."""
 
     coords = tokamak.coils_dict[coil_name]["coords"]
-    return (
-        tokamak.coils_dict[coil_name]["resistivity_over_area"]
-        * tokamak.coils_dict[coil_name]["multiplier"][0]
-        * np.sum(coords[0])
+    # Summing over the filaments (rather than multiplying by the summed
+    # radii) keeps this a scalar when the machine description stores
+    # resistivity_over_area as a one-element or per-filament array, as
+    # some pickled machine descriptions do.
+    return float(
+        np.sum(
+            np.asarray(tokamak.coils_dict[coil_name]["resistivity_over_area"])
+            * tokamak.coils_dict[coil_name]["multiplier"][0]
+            * coords[0]
+        )
     )
 
 

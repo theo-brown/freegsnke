@@ -84,6 +84,53 @@ def _require_torax():
         ) from _TORAX_IMPORT_ERROR
 
 
+def _make_torax_substepper(step_fn, verbose_log):
+    """
+    Returns a function advancing a TORAX state by an interval `dt` with TORAX's
+    own (fixed or adaptive) time steps, each capped at the end of the interval.
+
+    Unlike `step_fn.jitted_fixed_time_step`, the sub-stepping loop runs in
+    Python so that every TORAX time step is recorded: the function returns the
+    lists of states and post-processed outputs after each sub-step (excluding
+    the input state) and the TORAX error status. Each individual step is
+    jitted (the step function is a JAX pytree, so it can be passed as an
+    argument); the compilation happens once per array-shape signature.
+    """
+    import jax
+
+    @jax.jit
+    def single_step(step_fn, state, post_processed, max_dt, geo_provider):
+        return step_fn(state, post_processed, max_dt=max_dt, geo_overrides=geo_provider)
+
+    adaptive = bool(step_fn.runtime_params_provider.numerics.adaptive_dt)
+
+    def substep(state, post_processed, dt, geo_provider):
+        states, post_processed_outputs = [], []
+        remaining = float(dt)
+        sim_error = torax.SimError.NO_ERROR
+        while remaining > _MIN_RELATIVE_DT * dt:
+            state, post_processed = single_step(
+                step_fn, state, post_processed, jnp.asarray(remaining), geo_provider
+            )
+            sim_error = step_fn.check_for_errors(state, post_processed)
+            states.append(state)
+            post_processed_outputs.append(post_processed)
+            if sim_error != torax.SimError.NO_ERROR:
+                break
+            if adaptive and int(state.solver_numeric_outputs.solver_error_state) == 1:
+                # the adaptive stepper reached min_dt without converging
+                sim_error = torax.SimError.NAN_DETECTED
+                verbose_log(
+                    "Loose coupling: TORAX adaptive time stepping reached min_dt "
+                    f"without converging at t = {float(state.t):.5f} s."
+                )
+                break
+            remaining -= float(state.dt)
+        return states, post_processed_outputs, sim_error
+
+    return substep
+
+
 def default_psi_n_grid(n_points=129, psi_n_min=0.01, psi_n_max=0.99):
     """
     Normalised poloidal flux grid used when writing FreeGSNKE equilibria to an
@@ -657,10 +704,12 @@ class LooseCouplingResult:
     ----------
     torax_output : xarray.DataTree
         TORAX simulation output (as returned by `torax.run_simulation`), with
-        one entry per coupling time.
+        one entry per TORAX time step. TORAX takes its own (fixed or adaptive)
+        time steps within each coupling interval, so this is typically finer
+        than the coupling times.
     torax_history : torax.StateHistory
-        TORAX state history (states and post-processed outputs at each
-        coupling time).
+        TORAX state history (states and post-processed outputs at each TORAX
+        time step).
     equilibrium_ids : list
         FreeGSNKE `equilibrium` IDSs at each coupling time (including the
         initial one), i.e. the geometry TORAX used at that time.
@@ -681,6 +730,9 @@ class LooseCouplingResult:
     equilibria : list
         Copies of the FreeGSNKE equilibrium object at each coupling time, if
         requested (otherwise empty).
+    torax_substeps : np.array
+        Number of TORAX time steps taken within each coupling interval (the
+        first entry, for the initial condition, is 0).
     """
 
     torax_output: object
@@ -693,6 +745,9 @@ class LooseCouplingResult:
     converged: np.ndarray
     sim_error: object
     equilibria: list = dataclasses.field(default_factory=list)
+    torax_substeps: np.ndarray = dataclasses.field(
+        default_factory=lambda: np.zeros(0, int)
+    )
 
 
 def _copy_equilibrium(equilibrium_solver):
@@ -721,8 +776,10 @@ def run_loose_coupling(
     See the module docstring for a description of the algorithm. The TORAX
     simulation runs from `torax_config.numerics.t_initial` to
     `torax_config.numerics.t_final` in coupling intervals of `coupling_dt`
-    (TORAX may take several internal transport time steps within each interval,
-    using its own time step calculator). The geometry section of `torax_config`
+    (TORAX takes its own fixed or adaptive time steps within each interval, on
+    the geometry interpolated linearly in time between the equilibria at the
+    interval ends; every TORAX step is kept in the output). The geometry
+    section of `torax_config`
     is only used for the radial mesh: the geometry itself is provided by
     FreeGSNKE.
 
@@ -819,6 +876,8 @@ def run_loose_coupling(
         if verbose:
             print(message, flush=True)
 
+    advance_torax = _make_torax_substepper(step_fn, log)
+
     # ------------------------------------------------------------------ #
     # Initial condition: make the TORAX initial state consistent with the
     # FreeGSNKE equilibrium obtained from TORAX's own initial p' and FF'.
@@ -864,6 +923,7 @@ def run_loose_coupling(
     iterations = [len(initial_residuals)]
     residuals = [initial_residuals]
     converged = [converged_initial]
+    substeps = [0]
     equilibria = [_copy_equilibrium(equilibrium_solver)] if store_equilibria else []
     sim_error = torax.SimError.NO_ERROR
 
@@ -883,15 +943,19 @@ def run_loose_coupling(
         for iteration in range(max_iterations):
             eq_ids = equilibrium_solver.solve(t_next, guess_ids)
             geo_next = geometry_from(eq_ids)
-            new_state, new_post_processed = step_fn.jitted_fixed_time_step(
-                jnp.asarray(dt),
+            # TORAX advances over the interval with its own (fixed or adaptive)
+            # time steps, on the geometry interpolated linearly in time between
+            # the equilibria at the start and end of the interval.
+            new_states, new_post_processed_outputs, sim_error = advance_torax(
                 state,
                 post_processed,
-                geo_overrides=geometry_provider_for({t: geo, t_next: geo_next}),
+                dt,
+                geometry_provider_for({t: geo, t_next: geo_next}),
             )
-            sim_error = step_fn.check_for_errors(new_state, new_post_processed)
             if sim_error != torax.SimError.NO_ERROR:
                 break
+            new_state = new_states[-1]
+            new_post_processed = new_post_processed_outputs[-1]
             new_ids = torax_ids(new_state, new_post_processed)
             residual = profile_residual(new_ids, guess_ids)
             step_residuals.append(residual)
@@ -911,14 +975,15 @@ def run_loose_coupling(
         t = float(state.t)
         if hasattr(equilibrium_solver, "commit"):
             equilibrium_solver.commit(t, new_ids)
-        state_history.append(state)
-        post_processed_history.append(post_processed)
+        state_history.extend(new_states)
+        post_processed_history.extend(new_post_processed_outputs)
         equilibrium_ids_history.append(eq_ids)
         torax_ids_history.append(new_ids)
         times.append(t)
         iterations.append(len(step_residuals))
         residuals.append(step_residuals)
         converged.append(step_converged)
+        substeps.append(len(new_states))
         if store_equilibria:
             equilibria.append(_copy_equilibrium(equilibrium_solver))
         log(
@@ -926,6 +991,7 @@ def run_loose_coupling(
             "residuals "
             + ", ".join(f"{r:.2e}" for r in step_residuals)
             + ("" if step_converged else " (not converged)")
+            + f", {len(new_states)} TORAX step(s)"
             + f", {_time.time() - step_start:.1f} s wall time"
         )
 
@@ -951,4 +1017,5 @@ def run_loose_coupling(
         converged=np.asarray(converged),
         sim_error=sim_error,
         equilibria=equilibria,
+        torax_substeps=np.asarray(substeps),
     )

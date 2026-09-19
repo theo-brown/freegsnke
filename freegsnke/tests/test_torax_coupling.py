@@ -148,8 +148,12 @@ def test_run_loose_coupling(solved_test_equilibrium, torax_config):
     assert len(result.residuals) == 3
     assert np.all(result.iterations >= 1) and np.all(result.iterations <= 3)
     assert equilibrium_solver.n_solves == int(np.sum(result.iterations))
-    # TORAX time coordinate matches the coupling times
-    np.testing.assert_allclose(result.torax_output["time"].values, result.times)
+    # TORAX takes its own (here fixed, 5 ms) time steps within each 10 ms
+    # coupling interval, and every TORAX step is recorded in the output
+    np.testing.assert_array_equal(result.torax_substeps, [0, 2, 2])
+    np.testing.assert_allclose(
+        result.torax_output["time"].values, [0.0, 0.005, 0.01, 0.015, 0.02]
+    )
     # the plasma current in the final FreeGSNKE equilibrium is the TORAX one
     Ip_torax = float(result.torax_output["scalars"]["Ip"].values[-1])
     np.testing.assert_allclose(
