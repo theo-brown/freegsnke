@@ -149,6 +149,8 @@ class Droplets:
         self.dR_dZ = self.limiter_handler.dR_dZ
         self.R0Z0 = self.limiter_handler.R0Z0
         self.nx, self.ny = np.shape(eq.R)
+        self.R_1D = np.copy(eq.R_1D)
+        self.Z_1D = np.copy(eq.Z_1D)
         self.dRdZ = (eq.R_1D[1] - eq.R_1D[0]) * (eq.Z_1D[1] - eq.Z_1D[0])
 
         self.Ip_logic = True
@@ -186,6 +188,69 @@ class Droplets:
     def fpol(self, pn):
         """Poloidal current function of the primary droplet (see limitations)."""
         return self.droplets[0].fpol(pn)
+
+    def droplet_index(self, R: np.ndarray, Z: np.ndarray) -> np.ndarray:
+        """
+        Index of the droplet each point (R, Z) is associated with.
+
+        A point belongs to the droplet whose search region contains the grid
+        node nearest to it; points outside every search region are assigned
+        to the droplet with the nearest magnetic axis (requires a previous
+        call to :meth:`Jtor`).
+
+        Parameters
+        ----------
+        R, Z : array_like
+            Coordinates of the points [m].
+
+        Returns
+        -------
+        np.ndarray
+            Integer droplet index for each point (shape of ``R``).
+        """
+        R = np.atleast_1d(np.asarray(R, dtype=float))
+        Z = np.atleast_1d(np.asarray(Z, dtype=float))
+        iR = np.argmin(np.abs(self.R_1D[None, :] - R.reshape(-1, 1)), axis=1)
+        iZ = np.argmin(np.abs(self.Z_1D[None, :] - Z.reshape(-1, 1)), axis=1)
+        index = np.full(R.size, -1, dtype=int)
+        for k, region in enumerate(self.search_regions):
+            index[(index < 0) & region[iR, iZ]] = k
+        unassigned = index < 0
+        if np.any(unassigned):
+            if not hasattr(self, "opt"):
+                raise ValueError(
+                    "Points outside all search regions can only be assigned "
+                    "after Jtor has been evaluated."
+                )
+            dist = np.hypot(
+                R.reshape(-1)[unassigned, None] - self.opt[None, :, 0],
+                Z.reshape(-1)[unassigned, None] - self.opt[None, :, 1],
+            )
+            index[unassigned] = np.argmin(dist, axis=1)
+        return index.reshape(R.shape)
+
+    def flux_references(
+        self, R: np.ndarray, Z: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Axis and boundary flux of the droplet associated with each point, as
+        needed to normalise the flux droplet by droplet (see
+        :meth:`droplet_index`). Requires a previous call to :meth:`Jtor`.
+
+        Parameters
+        ----------
+        R, Z : array_like
+            Coordinates of the points [m].
+
+        Returns
+        -------
+        psi_axis, psi_bndry : np.ndarray
+            Axis and boundary flux of the owning droplet for each point.
+        """
+        index = self.droplet_index(R, Z)
+        axis = np.array([p.psi_axis for p in self.droplets])
+        bndry = np.array([p.psi_bndry for p in self.droplets])
+        return axis[index], bndry[index]
 
     def droplet_currents(self) -> np.ndarray:
         """

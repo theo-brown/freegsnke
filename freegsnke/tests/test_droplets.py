@@ -161,3 +161,19 @@ def test_droplets_input_validation(eq):
     profiles = DoubleDroplet(eq, p1, p2)
     with pytest.raises(NotImplementedError):
         profiles.Jtor(eq.R, eq.Z, np.zeros_like(eq.R), psi_bndry=0.1)
+
+
+def test_flux_references_are_per_droplet(eq):
+    """Normalised-flux references come from the droplet owning each point."""
+    psi = droplet_guess(eq, [1e5, 0.5e5], [(0.75, 0.6), (0.75, -0.6)], width=0.15)
+    profiles = make_profiles(eq, 1e5, 0.5e5)
+    profiles.Jtor(eq.R, eq.Z, psi)
+    upper, lower = profiles.droplets
+    assert not np.isclose(upper.psi_axis, lower.psi_axis)
+
+    R = np.array([0.75, 0.75, 0.75])
+    Z = np.array([0.6, -0.6, -0.1])
+    assert profiles.droplet_index(R, Z).tolist() == [0, 1, 1]
+    psi_axis, psi_bndry = profiles.flux_references(R, Z)
+    assert np.allclose(psi_axis, [upper.psi_axis, lower.psi_axis, lower.psi_axis])
+    assert np.allclose(psi_bndry, [upper.psi_bndry, lower.psi_bndry, lower.psi_bndry])

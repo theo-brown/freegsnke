@@ -1351,16 +1351,30 @@ class Inverse_optimizer:
                 A.T @ A
             ).max()
 
-            # sensitivity of ψ_norm w.r.t coil currents
-            psi_norm_A = self.G_psi_norm[self.control_mask].T
+            R_lim = self.psi_norm_limits[:, 0]
+            Z_lim = self.psi_norm_limits[:, 1]
 
-            # chain rule: G_psi_norm is derivative wrt ψ, not ψ_norm
-            psi_norm_A /= eq.psi_bndry - eq.psi_axis
+            # reference axis/boundary flux used to normalise each point: a
+            # single pair for one plasma, or the pair of the droplet each
+            # point belongs to for multi-droplet profiles
+            if hasattr(profiles, "flux_references"):
+                psi_axis_ref, psi_bndry_ref = profiles.flux_references(R_lim, Z_lim)
+            else:
+                psi_axis_ref = np.full(len(R_lim), eq.psi_axis)
+                psi_bndry_ref = np.full(len(R_lim), eq.psi_bndry)
+
+            # sensitivity of ψ_norm w.r.t coil currents
+            # (chain rule: G_psi_norm is derivative wrt ψ, not ψ_norm)
+            psi_norm_A = (
+                self.G_psi_norm[self.control_mask].T
+                / (psi_bndry_ref - psi_axis_ref)[:, np.newaxis]
+            )
 
             # residual between target ψ_norm and current ψ_norm
-            psi_norm_b = self.psi_norm_limits[:, 2] - eq.psiNRZ(
-                self.psi_norm_limits[:, 0], self.psi_norm_limits[:, 1]
+            psi_norm_now = (eq.psiRZ(R_lim, Z_lim) - psi_axis_ref) / (
+                psi_bndry_ref - psi_axis_ref
             )
+            psi_norm_b = self.psi_norm_limits[:, 2] - psi_norm_now
 
             for psin_limit_idx in range(self.psi_norm_limits.shape[0]):
                 psin_con_sign = self.psi_norm_limits[psin_limit_idx, 3]
