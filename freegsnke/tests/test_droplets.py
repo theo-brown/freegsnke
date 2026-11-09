@@ -211,3 +211,33 @@ def test_copy_does_not_alias_masks(eq):
         assert q is not p
         assert q.limiter_core_mask is not p.limiter_core_mask
         assert np.array_equal(q.limiter_core_mask, p.limiter_core_mask)
+
+
+def test_optimised_large_double_droplet(eq):
+    """Stored optimised design (example 12): two large diverted droplets."""
+    data = np.load(REPO_ROOT / "examples" / "data" / "double_droplet_SH3.npz")
+    for name, current in zip(data["coil_names"], data["coil_currents"]):
+        eq.tokamak.set_coil_current(str(name), float(current))
+    eq.set_plasma_psi(data["plasma_psi"])
+    paxis, Ip, fvac, alpha_m, alpha_n = data["profile"]
+    profiles = DoubleDroplet(
+        eq,
+        *[
+            ConstrainPaxisIp(eq, paxis, Ip, fvac, alpha_m=alpha_m, alpha_n=alpha_n)
+            for _ in range(2)
+        ],
+    )
+    solver = GSstaticsolver.NKGSsolver(eq)
+    solver.forward_solve(eq, profiles, 1e-8, suppress=True)
+    assert solver.relative_change < 1e-8
+
+    upper, lower = profiles.droplets
+    assert not upper.flag_limiter and not lower.flag_limiter
+    assert np.allclose(profiles.droplet_currents(), [4e5, 4e5])
+    assert np.allclose(upper.opt[0, :2], [0.872, 0.566], atol=0.03)
+    assert np.allclose(lower.opt[0, :2], [0.872, -0.566], atol=0.03)
+    assert np.allclose(upper.xpt[0, :2], [0.661, 1.062], atol=0.03)
+    assert np.allclose(lower.xpt[0, :2], [0.661, -1.062], atol=0.03)
+    area = [p.limiter_core_mask.sum() * profiles.dRdZ for p in profiles.droplets]
+    assert np.allclose(area, 0.379, atol=0.02)
+    assert not np.any(upper.limiter_core_mask & lower.limiter_core_mask)
