@@ -196,7 +196,9 @@ class Droplets:
         A point belongs to the droplet whose search region contains the grid
         node nearest to it; points outside every search region are assigned
         to the droplet with the nearest magnetic axis (requires a previous
-        call to :meth:`Jtor`).
+        call to :meth:`Jtor`). Assignment is by search region, not by
+        separatrix: a point close to the boundary between two search regions
+        (e.g. near ``Z_split``) is attributed to the droplet on its side.
 
         Parameters
         ----------
@@ -291,11 +293,27 @@ class Droplets:
             if len(candidates):
                 return candidates[np.argmax(sign * candidates[:, 2])]
 
-        # fall back to the grid maximum within the region
+        # fall back to the grid maximum within the region, but only if it is a
+        # genuine interior maximum of sign*psi (an O-point too small to be
+        # resolved by scan_for_crit). A maximum sitting on the edge of the
+        # allowed region is a vacuum-field feature, not a magnetic axis.
         if not np.any(allowed):
             raise ValueError(f"Search region of droplet {k} is outside the limiter.")
         masked = np.where(allowed, sign * psi, -np.inf)
         i, j = np.unravel_index(np.argmax(masked), masked.shape)
+        if (
+            i < 1
+            or j < 1
+            or i > self.nx - 2
+            or j > self.ny - 2
+            or not np.all(
+                sign * psi[[i + 1, i - 1, i, i], [j, j, j + 1, j - 1]]
+                < sign * psi[i, j]
+            )
+        ):
+            raise ValueError(
+                f"No magnetic axis (O-point) found in the search region of droplet {k}."
+            )
         return np.array([self.R_1D[i], self.Z_1D[j], psi[i, j]])
 
     def _droplet_xpoints(
@@ -331,7 +349,7 @@ class Droplets:
         sign: float,
         rel_tolerance: float = 1e-6,
         starting_dx: float = 0.05,
-    ) -> tuple[np.ndarray, float]:
+    ) -> tuple[np.ndarray, float, np.ndarray]:
         """
         Contour-based fallback for droplet k: find the lowest flux level whose
         closed contour around the droplet's axis encloses neither another
@@ -395,7 +413,9 @@ class Droplets:
             n_iter += 1
             path = enclosing_path(level)
             if path is None:
-                check_larger = True
+                # no contour encloses the axis: the level is above the axis
+                # value, i.e. the contour is "too small"; bisect downwards
+                check_larger = False
             else:
                 check_larger = np.any(path.contains_points(excluded_idx))
                 if not check_larger:
@@ -410,7 +430,15 @@ class Droplets:
         core = best_path.contains_points(self.limiter_handler.idx_grid_points)
         core = core.reshape((self.nx, self.ny))
         psi_bndry = sign * (best_level * del_psi + min_psi)
-        return core, psi_bndry
+        # synthetic X-point at the pinch of the contour (as in
+        # Jtor_universal.diverted_critical), so that the droplet still exposes
+        # an xpt row whose flux is its boundary flux
+        lcfs = best_path.vertices[:-1] * self.dR_dZ[np.newaxis] + self.R0Z0[np.newaxis]
+        dist = np.linalg.norm(lcfs[:, np.newaxis] - lcfs[np.newaxis, :], axis=-1)
+        dist += 10 * np.eye(len(lcfs))
+        pinch = np.any(dist == np.amin(dist), axis=0)
+        xpt = np.concatenate((np.mean(lcfs[pinch], axis=0), [psi_bndry]))[np.newaxis]
+        return core, psi_bndry, xpt
 
     # ------------------------------------------------------------------
     # Main interface
@@ -488,10 +516,9 @@ class Droplets:
                             diverted_core = None
                             break
             if diverted_core is None or not np.any(diverted_core):
-                diverted_core, d_bndry = self._contour_core(
+                diverted_core, d_bndry, xpt = self._contour_core(
                     k, psi, opt, [axes[j] for j in range(len(axes)) if j != k], sign
                 )
-                xpt = np.zeros((0, 3))
 
             core_in = diverted_core * self.mask_inside_limiter * np.logical_not(claimed)
             psi_b, core, flag = self.limiter_handler.core_mask_limiter(
@@ -503,6 +530,11 @@ class Droplets:
             core = core.astype(bool) * self.mask_inside_limiter
             if not np.any(core):
                 raise ValueError(f"Droplet {k} has an empty core.")
+            if sign * (opt[2] - psi_b) <= 0:
+                raise ValueError(
+                    f"Incorrect critical points for droplet {k}: axis and "
+                    "boundary flux are not ordered consistently with its Ip."
+                )
             claimed |= core
 
             jtor_k = p.Jtor_part2(R, Z, psi, opt[2], psi_b, core)
@@ -550,12 +582,10 @@ class Droplets:
             for attr in ("opt", "xpt", "psi_axis", "psi_bndry", "jtor"):
                 if hasattr(p, attr):
                     setattr(q, attr, np.copy(getattr(p, attr)))
-            for attr in (
-                "diverted_core_mask",
-                "limiter_core_mask",
-                "flag_limiter",
-                "has_relevant_xpoint",
-            ):
+            for attr in ("diverted_core_mask", "limiter_core_mask"):
+                if hasattr(p, attr):
+                    setattr(q, attr, np.copy(getattr(p, attr)))
+            for attr in ("flag_limiter", "has_relevant_xpoint"):
                 if hasattr(p, attr):
                     setattr(q, attr, getattr(p, attr))
             obj.droplets.append(q)

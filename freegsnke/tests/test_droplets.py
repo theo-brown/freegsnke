@@ -177,3 +177,37 @@ def test_flux_references_are_per_droplet(eq):
     psi_axis, psi_bndry = profiles.flux_references(R, Z)
     assert np.allclose(psi_axis, [upper.psi_axis, lower.psi_axis, lower.psi_axis])
     assert np.allclose(psi_bndry, [upper.psi_bndry, lower.psi_bndry, lower.psi_bndry])
+
+
+def test_vacuum_field_has_no_droplet_axis(eq):
+    """Without plasma the vacuum field has no interior O-point: no fake axis."""
+    psi_vacuum = eq.tokamak.getPsitokamak(vgreen=eq._vgreen)
+    profiles = make_profiles(eq, 1e5, 1e5)
+    with pytest.raises(ValueError, match="No magnetic axis"):
+        profiles.Jtor(eq.R, eq.Z, psi_vacuum)
+
+
+def test_contour_fallback_on_shallow_droplets(eq):
+    """The contour fallback recovers the separatrix of weak droplets."""
+    psi = droplet_guess(eq, [3e4, 3e4], [(0.75, 0.6), (0.75, -0.6)], width=0.15)
+    profiles = make_profiles(eq, 3e4, 3e4)
+    profiles.Jtor(eq.R, eq.Z, psi)
+    upper, lower = profiles.droplets
+    core, psi_bndry, xpt = profiles._contour_core(
+        0, psi, upper.opt[0], [lower.opt[0]], 1.0
+    )
+    # same boundary as the X-point based flood fill, to within grid accuracy
+    assert np.isclose(psi_bndry, upper.xpt[0, 2], rtol=1e-3)
+    assert xpt.shape == (1, 3) and np.isclose(xpt[0, 2], psi_bndry)
+    assert abs(int(core.sum()) - int(upper.diverted_core_mask.sum())) < 10
+
+
+def test_copy_does_not_alias_masks(eq):
+    psi = droplet_guess(eq, [1e5, 1e5], [(0.75, 0.6), (0.75, -0.6)], width=0.15)
+    profiles = make_profiles(eq, 1e5, 1e5)
+    profiles.Jtor(eq.R, eq.Z, psi)
+    copied = profiles.copy()
+    for p, q in zip(profiles.droplets, copied.droplets):
+        assert q is not p
+        assert q.limiter_core_mask is not p.limiter_core_mask
+        assert np.array_equal(q.limiter_core_mask, p.limiter_core_mask)
